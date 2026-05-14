@@ -511,6 +511,9 @@ onMounted(async () => {
   const mountStart = performance.now();
   applyTheme();
   window.addEventListener("keydown", handleKeydown, true);
+  window.addEventListener("dbx-open-driver-store", () => {
+    showDriverStore.value = true;
+  });
   if (isDesktop) {
     document.addEventListener("contextmenu", handleContextMenu);
   }

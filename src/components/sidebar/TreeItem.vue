@@ -305,7 +305,11 @@ async function toggle() {
     }
   } catch (e: any) {
     if (!wasExpanded) node.isExpanded = false;
-    toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
+    const errMsg = e?.message || String(e);
+    toast(t("connection.connectFailed", { message: translateBackendError(t, errMsg) }), 5000);
+    if (errMsg.includes("driver is not installed") || errMsg.includes("is not installed")) {
+      window.dispatchEvent(new Event("dbx-open-driver-store"));
+    }
   }
 }
 
@@ -361,6 +365,12 @@ async function openObjectBrowser() {
     }
   } catch (e: any) {
     toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
+    if (
+      e?.message?.includes("driver is not installed") ||
+      (e?.message?.includes("JRE") && e?.message?.includes("not installed"))
+    ) {
+      window.dispatchEvent(new Event("dbx-open-driver-store"));
+    }
   }
 }
 
@@ -463,6 +473,12 @@ async function newQuery() {
     queryStore.createTab(node.connectionId, resolveDefaultDatabase(connection, options), undefined, "query");
   } catch (e: any) {
     toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
+    if (
+      e?.message?.includes("driver is not installed") ||
+      (e?.message?.includes("JRE") && e?.message?.includes("not installed"))
+    ) {
+      window.dispatchEvent(new Event("dbx-open-driver-store"));
+    }
   }
 }
 
@@ -491,6 +507,12 @@ async function refresh() {
     await connectionStore.refreshTreeNode(props.node);
   } catch (e: any) {
     toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
+    if (
+      e?.message?.includes("driver is not installed") ||
+      (e?.message?.includes("JRE") && e?.message?.includes("not installed"))
+    ) {
+      window.dispatchEvent(new Event("dbx-open-driver-store"));
+    }
   }
 }
 
