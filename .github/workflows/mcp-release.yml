@@ -157,8 +157,13 @@ jobs:
       - name: Create or update release PR
         if: steps.current.outputs.published == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.MCP_RELEASE_TOKEN }}
         run: |
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::error::MCP_RELEASE_TOKEN secret is required to create MCP release pull requests."
+            exit 1
+          fi
+
           VERSION="${{ steps.version.outputs.version }}"
           BRANCH="codex/mcp-release-${VERSION}"
           TITLE="chore(mcp): release ${VERSION}"
