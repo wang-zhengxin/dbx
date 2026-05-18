@@ -471,15 +471,29 @@ fn oracle_jdbc_connection_string(config: &ConnectionConfig, host: &str, port: u1
 }
 
 pub async fn probe_connection_endpoint(config: &ConnectionConfig, host: &str, port: u16) -> Result<(), String> {
-    if config.db_type == DatabaseType::MongoDb
-        && config.connection_string.as_deref().is_some_and(|value| !value.is_empty())
-    {
-        return Ok(());
-    }
-    if database_capabilities::skips_tcp_probe(&config.db_type) {
+    if !uses_tcp_probe(config, host, port) {
         return Ok(());
     }
     db::probe_tcp_endpoint(&format!("{:?}", config.db_type), host, port).await
+}
+
+fn uses_tcp_probe(config: &ConnectionConfig, host: &str, port: u16) -> bool {
+    if config.db_type == DatabaseType::MongoDb
+        && config.connection_string.as_deref().is_some_and(|value| !value.is_empty())
+    {
+        return false;
+    }
+    if database_capabilities::skips_tcp_probe(&config.db_type) {
+        return false;
+    }
+    if matches!(config.db_type, DatabaseType::Mysql | DatabaseType::Doris | DatabaseType::StarRocks)
+        && host == config.host
+        && port == config.port
+        && host.parse::<std::net::IpAddr>().is_err()
+    {
+        return false;
+    }
+    true
 }
 
 async fn detect_ob_oracle_mode(config: &ConnectionConfig, pool: &sqlx::mysql::MySqlPool) -> MysqlMode {
@@ -498,7 +512,10 @@ async fn detect_ob_oracle_mode(config: &ConnectionConfig, pool: &sqlx::mysql::My
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_connect_params, database_connection_config, metadata_connection_config, AppState, PoolKind};
+    use super::{
+        agent_connect_params, database_connection_config, metadata_connection_config, uses_tcp_probe, AppState,
+        PoolKind,
+    };
     use crate::models::connection::{ConnectionConfig, DatabaseType, ProxyType};
     use crate::schema;
     use crate::storage::Storage;
@@ -646,6 +663,16 @@ mod tests {
         let scoped = database_connection_config(&config, Some("analytics"));
 
         assert_eq!(scoped.database.as_deref(), Some("ORCL"));
+    }
+
+    #[test]
+    fn mysql_hostname_connections_skip_tcp_probe() {
+        let mut config = mysql_config(Some("app"));
+        config.host = "mysql.example.com".to_string();
+
+        assert!(!uses_tcp_probe(&config, "mysql.example.com", 3306));
+        assert!(uses_tcp_probe(&config, "192.0.2.10", 3306));
+        assert!(uses_tcp_probe(&config, "127.0.0.1", 53306));
     }
 
     #[tokio::test]
