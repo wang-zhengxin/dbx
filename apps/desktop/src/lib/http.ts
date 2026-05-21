@@ -105,6 +105,10 @@ export async function loadConnections(): Promise<ConnectionConfig[]> {
   return get("/api/connection/list");
 }
 
+export async function listSystemFonts(): Promise<string[]> {
+  return [];
+}
+
 export async function listPlugins(): Promise<InstalledPlugin[]> {
   return get("/api/plugins");
 }

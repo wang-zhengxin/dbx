@@ -117,6 +117,10 @@ export async function loadAiConfig(): Promise<AiConfig | null> {
   return invoke("load_ai_config");
 }
 
+export async function listSystemFonts(): Promise<string[]> {
+  return invoke("list_system_fonts");
+}
+
 export async function pendingOpenSqlFiles(): Promise<string[]> {
   return invoke("pending_open_sql_files");
 }

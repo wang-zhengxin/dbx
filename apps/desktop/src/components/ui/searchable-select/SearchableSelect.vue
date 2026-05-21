@@ -17,13 +17,17 @@ const props = withDefaults(
     emptyText: string;
     loadingText: string;
     loading?: boolean;
+    allowCustom?: boolean;
     triggerClass?: HTMLAttributes["class"];
     contentClass?: HTMLAttributes["class"];
     displayName?: (option: string) => string;
+    normalizeCustom?: (value: string) => string;
   }>(),
   {
     loading: false,
+    allowCustom: false,
     displayName: (option: string) => option,
+    normalizeCustom: (value: string) => value,
   },
 );
 
@@ -42,6 +46,10 @@ const selectedLabel = computed(() => {
 });
 
 const filteredOptions = computed(() => filterDatabaseOptions(props.options, searchText.value, props.displayName));
+const customOptionValue = computed(() => props.normalizeCustom(searchText.value.trim()));
+const canSelectCustom = computed(
+  () => props.allowCustom && !!customOptionValue.value && !props.options.includes(customOptionValue.value),
+);
 
 watch(open, async (value) => {
   emit("update:open", value);
@@ -57,6 +65,11 @@ watch(open, async (value) => {
 function selectOption(option: string) {
   emit("update:modelValue", option);
   open.value = false;
+}
+
+function selectCustomOption() {
+  if (!canSelectCustom.value) return;
+  selectOption(customOptionValue.value);
 }
 </script>
 
@@ -107,7 +120,29 @@ function selectOption(option: string) {
               <span class="truncate">{{ displayName(option) }}</span>
             </slot>
           </button>
+          <button
+            v-if="canSelectCustom"
+            type="button"
+            class="flex h-8 w-full min-w-0 items-center gap-2 rounded-sm px-2 text-left text-sm hover:bg-accent hover:text-accent-foreground focus-visible:bg-accent focus-visible:text-accent-foreground focus-visible:outline-none"
+            @click="selectCustomOption"
+          >
+            <Check class="h-3.5 w-3.5 shrink-0 opacity-0" />
+            <slot name="custom-option-label" :value="customOptionValue">
+              <span class="truncate">{{ customOptionValue }}</span>
+            </slot>
+          </button>
         </template>
+        <button
+          v-else-if="canSelectCustom"
+          type="button"
+          class="flex h-8 w-full min-w-0 items-center gap-2 rounded-sm px-2 text-left text-sm hover:bg-accent hover:text-accent-foreground focus-visible:bg-accent focus-visible:text-accent-foreground focus-visible:outline-none"
+          @click="selectCustomOption"
+        >
+          <Check class="h-3.5 w-3.5 shrink-0 opacity-0" />
+          <slot name="custom-option-label" :value="customOptionValue">
+            <span class="truncate">{{ customOptionValue }}</span>
+          </slot>
+        </button>
         <div v-else class="px-2 py-2 text-sm text-muted-foreground">
           {{ emptyText }}
         </div>
