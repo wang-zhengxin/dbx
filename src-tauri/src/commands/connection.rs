@@ -504,27 +504,7 @@ pub async fn disconnect_db(state: State<'_, Arc<AppState>>, connection_id: Strin
         conns.keys().filter(|k| *k == &connection_id || k.starts_with(&format!("{connection_id}:"))).cloned().collect();
     for key in keys_to_remove {
         if let Some(pool) = conns.remove(&key) {
-            match pool {
-                PoolKind::Mysql(p, _) => {
-                    let _ = p.disconnect().await;
-                }
-                PoolKind::Postgres(p) => p.close(),
-                PoolKind::Sqlite(_) => {}
-                PoolKind::Redis(_) => {}
-                PoolKind::DuckDb(con) => {
-                    dbx_core::db::duckdb_driver::close_connection(con);
-                }
-                PoolKind::MongoDb(_) => {}
-                PoolKind::ClickHouse(_) => {}
-                PoolKind::SqlServer(_) => {}
-                PoolKind::Elasticsearch(_) => {}
-                PoolKind::Agent(client) => {
-                    let mut client = client.lock().await;
-                    let _ = client.disconnect().await;
-                }
-                PoolKind::ExternalTabular(_) => {}
-                PoolKind::ExternalDriver { .. } => {}
-            }
+            dbx_core::connection::close_pool_kind(pool).await;
         }
     }
     drop(conns);

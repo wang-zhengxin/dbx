@@ -471,7 +471,10 @@ impl AppState {
             self.remove_connection_pools(connection_id).await;
             self.reset_connection_transport(connection_id).await;
         } else {
-            self.connections.write().await.remove(&pool_key);
+            let removed = self.connections.write().await.remove(&pool_key);
+            if let Some(pool) = removed {
+                close_pool_kind(pool).await;
+            }
         }
         self.get_or_create_pool_for_session(connection_id, database, client_session_id).await
     }
@@ -492,7 +495,13 @@ impl AppState {
         };
         let base_pool_key = base_pool_key_for(db_type, connection_id, database, false);
         let pool_key = session_scoped_pool_key(base_pool_key, Some(&session));
-        Ok(self.connections.write().await.remove(&pool_key).is_some())
+        let removed = self.connections.write().await.remove(&pool_key);
+        if let Some(pool) = removed {
+            close_pool_kind(pool).await;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     pub async fn duckdb_existing_pool_is_usable_for_config(&self, config: &ConnectionConfig) -> Result<bool, String> {
@@ -539,10 +548,15 @@ impl AppState {
             .filter(|k| *k == connection_id || k.starts_with(&format!("{connection_id}:")))
             .cloned()
             .collect();
+        let mut removed = Vec::with_capacity(keys_to_remove.len());
         for key in keys_to_remove {
-            if let Some(PoolKind::DuckDb(con)) = conns.remove(&key) {
-                crate::db::duckdb_driver::close_connection(con);
+            if let Some(pool) = conns.remove(&key) {
+                removed.push(pool);
             }
+        }
+        drop(conns);
+        for pool in removed {
+            close_pool_kind(pool).await;
         }
     }
 
@@ -563,6 +577,30 @@ fn session_scoped_pool_key(base_pool_key: String, client_session_id: Option<&str
     normalize_client_session_id(client_session_id)
         .map(|session| format!("{base_pool_key}:session:{session}"))
         .unwrap_or(base_pool_key)
+}
+
+pub async fn close_pool_kind(pool: PoolKind) {
+    match pool {
+        PoolKind::Mysql(p, _) => {
+            let _ = p.disconnect().await;
+        }
+        PoolKind::Postgres(p) => p.close(),
+        PoolKind::Sqlite(_) => {}
+        PoolKind::Redis(_) => {}
+        PoolKind::DuckDb(con) => {
+            crate::db::duckdb_driver::close_connection(con);
+        }
+        PoolKind::MongoDb(_) => {}
+        PoolKind::ClickHouse(_) => {}
+        PoolKind::SqlServer(_) => {}
+        PoolKind::Elasticsearch(_) => {}
+        PoolKind::Agent(client) => {
+            let mut client = client.lock().await;
+            let _ = client.disconnect().await;
+        }
+        PoolKind::ExternalTabular(_) => {}
+        PoolKind::ExternalDriver { .. } => {}
+    }
 }
 
 fn base_pool_key_for(
@@ -1438,6 +1476,32 @@ mod tests {
         assert!(!conns.contains_key("conn:session:tab-1"));
         assert!(!conns.contains_key("conn:analytics:session:tab-1"));
         assert!(conns.contains_key("other"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn close_client_session_pool_removes_session_scoped_duckdb_pool() {
+        let (state, dir) = test_app_state().await;
+        let db_path = dir.join("session.duckdb");
+        let mut config = mysql_config(None);
+        config.id = "duckdb-conn".to_string();
+        config.name = "DuckDB".to_string();
+        config.db_type = DatabaseType::DuckDb;
+        config.host = db_path.to_string_lossy().to_string();
+        config.port = 0;
+
+        state.configs.write().await.insert(config.id.clone(), config.clone());
+        let pool_key = state
+            .get_or_create_pool_for_session("duckdb-conn", Some("main"), Some("tab-1"))
+            .await
+            .unwrap();
+        assert_eq!(pool_key, "duckdb-conn:session:tab-1");
+
+        assert!(state.close_client_session_pool("duckdb-conn", Some("main"), "tab-1").await.unwrap());
+
+        let conns = state.connections.read().await;
+        assert!(!conns.contains_key("duckdb-conn:session:tab-1"));
 
         let _ = std::fs::remove_dir_all(dir);
     }
