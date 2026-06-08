@@ -453,16 +453,20 @@ async fn list_tables_once(
             drop(connections);
             let mut client = client.lock().await;
             match client.list_tables::<Vec<db::TableInfo>>(database, schema).await {
-                Ok(tables) if !tables.is_empty() => return Ok(filter_table_infos(tables, filter, limit)),
+                Ok(tables) if !tables.is_empty() => {
+                    return Ok(filter_table_infos_for_config(tables, filter, limit, db_config.as_ref()))
+                }
                 Ok(tables) => {
                     if let Some(config) = fallback_config.as_ref() {
                         match native_postgres_metadata_pool(state, connection_id, database, config).await {
                             Ok(Some(pool)) => {
-                                return db::postgres::list_tables(&pool, schema)
-                                    .await
-                                    .map(|tables| filter_table_infos(tables, filter, limit));
+                                return db::postgres::list_tables(&pool, schema).await.map(|tables| {
+                                    filter_table_infos_for_config(tables, filter, limit, db_config.as_ref())
+                                });
                             }
-                            Ok(None) => return Ok(filter_table_infos(tables, filter, limit)),
+                            Ok(None) => {
+                                return Ok(filter_table_infos_for_config(tables, filter, limit, db_config.as_ref()))
+                            }
                             Err(error) => {
                                 log::warn!(
                                     "[schema][agent:list_tables:fallback-failed] connection_id={} database={} schema={} error={}",
@@ -474,7 +478,7 @@ async fn list_tables_once(
                             }
                         }
                     }
-                    return Ok(filter_table_infos(tables, filter, limit));
+                    return Ok(filter_table_infos_for_config(tables, filter, limit, db_config.as_ref()));
                 }
                 Err(agent_error) => {
                     if let Some(config) = fallback_config.as_ref() {
@@ -483,7 +487,7 @@ async fn list_tables_once(
                         {
                             return db::postgres::list_tables(&pool, schema)
                                 .await
-                                .map(|tables| filter_table_infos(tables, filter, limit))
+                                .map(|tables| filter_table_infos_for_config(tables, filter, limit, db_config.as_ref()))
                                 .map_err(|fallback_error| {
                                     format!(
                                         "{agent_error}\n\nNative PostgreSQL metadata fallback failed: {fallback_error}"
@@ -502,29 +506,31 @@ async fn list_tables_once(
 
     match pool {
         PoolKind::Mysql(p, _) if db_config.as_ref().is_some_and(is_doris_family_config) => {
-            db::mysql::list_tables_show(p, database).await.map(|tables| filter_table_infos(tables, filter, limit))
+            db::mysql::list_tables_show(p, database)
+                .await
+                .map(|tables| filter_table_infos_for_config(tables, filter, limit, db_config.as_ref()))
         }
         PoolKind::Mysql(p, mode) => {
             dispatch_mysql!(p, mode, db::mysql::list_tables, db::ob_oracle::list_tables, schema)
-                .map(|tables| filter_table_infos(tables, filter, limit))
+                .map(|tables| filter_table_infos_for_config(tables, filter, limit, db_config.as_ref()))
         }
-        PoolKind::Postgres(p) => {
-            db::postgres::list_tables(p, schema).await.map(|tables| filter_table_infos(tables, filter, limit))
-        }
-        PoolKind::Sqlite(p) => {
-            db::sqlite::list_tables(p, schema).await.map(|tables| filter_table_infos(tables, filter, limit))
-        }
-        PoolKind::Rqlite(client) => {
-            db::rqlite_driver::list_tables(client, schema).await.map(|tables| filter_table_infos(tables, filter, limit))
-        }
+        PoolKind::Postgres(p) => db::postgres::list_tables(p, schema)
+            .await
+            .map(|tables| filter_table_infos_for_config(tables, filter, limit, db_config.as_ref())),
+        PoolKind::Sqlite(p) => db::sqlite::list_tables(p, schema)
+            .await
+            .map(|tables| filter_table_infos_for_config(tables, filter, limit, db_config.as_ref())),
+        PoolKind::Rqlite(client) => db::rqlite_driver::list_tables(client, schema)
+            .await
+            .map(|tables| filter_table_infos_for_config(tables, filter, limit, db_config.as_ref())),
         PoolKind::MongoDb(client) => db::mongo_driver::list_collections(client, database)
             .await
             .map(|names| collection_names_to_tables(names, "COLLECTION"))
-            .map(|tables| filter_table_infos(tables, filter, limit)),
+            .map(|tables| filter_table_infos_for_config(tables, filter, limit, db_config.as_ref())),
         PoolKind::Elasticsearch(client) => db::elasticsearch_driver::list_indices(client)
             .await
             .map(|names| collection_names_to_tables(names, "INDEX"))
-            .map(|tables| filter_table_infos(tables, filter, limit)),
+            .map(|tables| filter_table_infos_for_config(tables, filter, limit, db_config.as_ref())),
         _ => Ok(vec![]),
     }
 }
@@ -552,11 +558,49 @@ fn filter_table_infos(tables: Vec<db::TableInfo>, filter: Option<&str>, limit: O
         .collect()
 }
 
+fn filter_table_infos_for_config(
+    tables: Vec<db::TableInfo>,
+    filter: Option<&str>,
+    limit: Option<usize>,
+    config: Option<&ConnectionConfig>,
+) -> Vec<db::TableInfo> {
+    filter_table_infos(filter_yashandb_recyclebin_tables(tables, config), filter, limit)
+}
+
+fn filter_yashandb_recyclebin_tables(
+    tables: Vec<db::TableInfo>,
+    config: Option<&ConnectionConfig>,
+) -> Vec<db::TableInfo> {
+    if !is_yashandb_config(config) {
+        return tables;
+    }
+    tables.into_iter().filter(|table| !is_recyclebin_object_name(&table.name)).collect()
+}
+
+fn filter_yashandb_recyclebin_objects(
+    objects: Vec<db::ObjectInfo>,
+    config: Option<&ConnectionConfig>,
+) -> Vec<db::ObjectInfo> {
+    if !is_yashandb_config(config) {
+        return objects;
+    }
+    objects.into_iter().filter(|object| !is_recyclebin_object_name(&object.name)).collect()
+}
+
+fn is_yashandb_config(config: Option<&ConnectionConfig>) -> bool {
+    config.is_some_and(|config| config.db_type == DatabaseType::Yashandb)
+}
+
+fn is_recyclebin_object_name(name: &str) -> bool {
+    name.to_ascii_uppercase().starts_with("BIN$")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         clickhouse_metadata_database, deduplicate_column_infos, duckdb_attach_database, duckdb_list_databases,
-        duckdb_query_tables_in_database, filter_objects_by_types, is_agent_postgres_metadata_fallback_config,
+        duckdb_query_tables_in_database, filter_objects_by_types, filter_yashandb_recyclebin_objects,
+        filter_yashandb_recyclebin_tables, is_agent_postgres_metadata_fallback_config,
     };
     use crate::models::connection::{ConnectionConfig, DatabaseType};
 
@@ -729,6 +773,64 @@ mod tests {
             ["active_orders", "payroll"]
         );
     }
+
+    #[test]
+    fn filters_yashandb_recyclebin_tables() {
+        let tables = vec![
+            super::db::TableInfo {
+                name: "USERS".to_string(),
+                table_type: "TABLE".to_string(),
+                comment: None,
+                parent_schema: None,
+                parent_name: None,
+            },
+            super::db::TableInfo {
+                name: "BIN$abc123==$0".to_string(),
+                table_type: "TABLE".to_string(),
+                comment: None,
+                parent_schema: None,
+                parent_name: None,
+            },
+        ];
+
+        let filtered =
+            filter_yashandb_recyclebin_tables(tables.clone(), Some(&test_connection_config(DatabaseType::Yashandb)));
+        let oracle = filter_yashandb_recyclebin_tables(tables, Some(&test_connection_config(DatabaseType::Oracle)));
+
+        assert_eq!(filtered.iter().map(|table| table.name.as_str()).collect::<Vec<_>>(), ["USERS"]);
+        assert_eq!(oracle.len(), 2);
+    }
+
+    #[test]
+    fn filters_yashandb_recyclebin_objects() {
+        let objects = vec![
+            super::db::ObjectInfo {
+                name: "ORDERS".to_string(),
+                object_type: "TABLE".to_string(),
+                schema: Some("HR".to_string()),
+                comment: None,
+                created_at: None,
+                updated_at: None,
+                parent_schema: None,
+                parent_name: None,
+            },
+            super::db::ObjectInfo {
+                name: "bin$deleted".to_string(),
+                object_type: "TABLE".to_string(),
+                schema: Some("HR".to_string()),
+                comment: None,
+                created_at: None,
+                updated_at: None,
+                parent_schema: None,
+                parent_name: None,
+            },
+        ];
+
+        let filtered =
+            filter_yashandb_recyclebin_objects(objects, Some(&test_connection_config(DatabaseType::Yashandb)));
+
+        assert_eq!(filtered.iter().map(|object| object.name.as_str()).collect::<Vec<_>>(), ["ORDERS"]);
+    }
 }
 
 pub async fn list_objects_core(
@@ -763,8 +865,10 @@ async fn list_objects_once(
     schema: &str,
     object_types: Option<&[String]>,
 ) -> Result<Vec<db::ObjectInfo>, String> {
+    let db_config = connection_config(state, connection_id).await;
     list_objects_once_unfiltered(state, connection_id, database, schema)
         .await
+        .map(|objects| filter_yashandb_recyclebin_objects(objects, db_config.as_ref()))
         .map(|objects| filter_objects_by_types(objects, object_types))
 }
 
@@ -814,11 +918,11 @@ async fn list_objects_once_unfiltered(
         }
         try_sqlserver!(connections, &pool_key, list_objects, schema);
         if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
-            let is_oracle = db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Oracle);
+            let oracle_object_options = db_config.as_ref().and_then(oracle_agent_object_options);
             let fallback_config = db_config.clone();
             drop(connections);
-            if is_oracle {
-                return oracle_agent_list_objects(client, database, schema).await;
+            if let Some(options) = oracle_object_options {
+                return oracle_agent_list_objects(client, database, schema, options).await;
             }
             let mut client = client.lock().await;
             match client.list_objects::<Vec<db::ObjectInfo>>(database, schema).await {
@@ -944,11 +1048,11 @@ async fn list_completion_objects_once(
             .map(filter_completion_objects);
     }
     if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
-        let is_oracle = db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Oracle);
+        let oracle_object_options = db_config.as_ref().and_then(oracle_agent_object_options);
         let fallback_config = db_config.clone();
         drop(connections);
-        let objects = if is_oracle {
-            oracle_agent_list_objects(client, database, schema).await?
+        let objects = if let Some(options) = oracle_object_options {
+            oracle_agent_list_objects(client, database, schema, options).await?
         } else {
             let mut client = client.lock().await;
             match client.list_objects::<Vec<db::ObjectInfo>>(database, schema).await {
@@ -994,6 +1098,7 @@ async fn list_completion_objects_once(
                 }
             }
         };
+        let objects = filter_yashandb_recyclebin_objects(objects, fallback_config.as_ref());
         return Ok(filter_completion_objects(objects));
     }
 
@@ -1650,13 +1755,28 @@ fn oracle_owner_filter(schema: &str) -> String {
     }
 }
 
-pub fn oracle_list_objects_sql(schema: &str) -> String {
+#[derive(Debug, Clone, Copy)]
+struct OracleAgentObjectOptions {
+    hide_recyclebin_objects: bool,
+}
+
+fn oracle_agent_object_options(config: &ConnectionConfig) -> Option<OracleAgentObjectOptions> {
+    match config.db_type {
+        DatabaseType::Oracle => Some(OracleAgentObjectOptions { hide_recyclebin_objects: false }),
+        DatabaseType::Yashandb => Some(OracleAgentObjectOptions { hide_recyclebin_objects: true }),
+        _ => None,
+    }
+}
+
+pub fn oracle_list_objects_sql(schema: &str, hide_recyclebin_objects: bool) -> String {
+    let recyclebin_filter = if hide_recyclebin_objects { " AND object_name NOT LIKE 'BIN$%'" } else { "" };
     format!(
         "SELECT object_name, CASE object_type WHEN 'PACKAGE BODY' THEN 'PACKAGE_BODY' ELSE object_type END AS object_type, owner \
          FROM all_objects \
-         WHERE owner = {} AND object_type IN ('TABLE', 'VIEW', 'PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY') \
+         WHERE owner = {} AND object_type IN ('TABLE', 'VIEW', 'PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY'){} \
          ORDER BY CASE object_type WHEN 'TABLE' THEN 0 WHEN 'VIEW' THEN 1 WHEN 'PROCEDURE' THEN 2 WHEN 'FUNCTION' THEN 3 WHEN 'PACKAGE' THEN 4 ELSE 5 END, object_name",
-        oracle_owner_filter(schema)
+        oracle_owner_filter(schema),
+        recyclebin_filter
     )
 }
 
@@ -1664,8 +1784,9 @@ async fn oracle_agent_list_objects(
     client: Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>,
     database: &str,
     schema: &str,
+    options: OracleAgentObjectOptions,
 ) -> Result<Vec<db::ObjectInfo>, String> {
-    let sql = oracle_list_objects_sql(schema);
+    let sql = oracle_list_objects_sql(schema, options.hide_recyclebin_objects);
     let params = agent_execute_query_params(
         &sql,
         if database.is_empty() { None } else { Some(database) },
@@ -1796,12 +1917,20 @@ mod object_source_tests {
 
     #[test]
     fn builds_oracle_list_objects_sql_with_packages() {
-        let sql = oracle_list_objects_sql("hr");
+        let sql = oracle_list_objects_sql("hr", false);
 
         assert!(sql.contains("'PACKAGE'"));
         assert!(sql.contains("'PACKAGE BODY'"));
         assert!(sql.contains("CASE object_type WHEN 'PACKAGE BODY' THEN 'PACKAGE_BODY'"));
         assert!(sql.contains("owner = 'HR'"));
+        assert!(!sql.contains("BIN$"));
+    }
+
+    #[test]
+    fn builds_yashandb_list_objects_sql_without_recyclebin_objects() {
+        let sql = oracle_list_objects_sql("hr", true);
+
+        assert!(sql.contains("object_name NOT LIKE 'BIN$%'"));
     }
 }
 
