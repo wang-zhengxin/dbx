@@ -578,6 +578,7 @@ fn parse_elasticsearch_response(
         Ok(crate::types::QueryResult {
             columns: all_keys,
             column_types: Vec::new(),
+            column_sortables: vec![],
             rows,
             affected_rows: row_count,
             execution_time_ms: start.elapsed().as_millis(),
@@ -592,6 +593,7 @@ fn parse_elasticsearch_response(
             Ok(crate::types::QueryResult {
                 columns,
                 column_types: Vec::new(),
+                column_sortables: vec![],
                 rows,
                 affected_rows: row_count,
                 execution_time_ms: start.elapsed().as_millis(),
@@ -604,6 +606,7 @@ fn parse_elasticsearch_response(
             Ok(crate::types::QueryResult {
                 columns: vec!["status".to_string(), "response".to_string()],
                 column_types: Vec::new(),
+                column_sortables: vec![],
                 rows: vec![vec![serde_json::Value::Number(status.into()), serde_json::Value::String(pretty)]],
                 affected_rows: 0,
                 execution_time_ms: start.elapsed().as_millis(),
@@ -617,6 +620,7 @@ fn parse_elasticsearch_response(
         Ok(crate::types::QueryResult {
             columns: vec!["status".to_string(), "response".to_string()],
             column_types: Vec::new(),
+            column_sortables: vec![],
             rows: vec![vec![serde_json::Value::Number(status.into()), serde_json::Value::String(pretty)]],
             affected_rows: 0,
             execution_time_ms: start.elapsed().as_millis(),
@@ -1035,6 +1039,7 @@ fn parse_sql_response(body: &serde_json::Value, start: std::time::Instant) -> Op
     Some(crate::types::QueryResult {
         columns: column_names,
         column_types: Vec::new(),
+        column_sortables: vec![],
         rows: result_rows,
         affected_rows: rows.len() as u64,
         execution_time_ms: start.elapsed().as_millis(),
