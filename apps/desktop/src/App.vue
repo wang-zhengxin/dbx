@@ -1082,6 +1082,15 @@ onMounted(async () => {
   if (isDesktop) {
     document.addEventListener("contextmenu", handleContextMenu);
   }
+  // macOS: Ctrl+click fires both click and contextmenu.
+  // Intercept click in capture phase to prevent unwanted navigation.
+  document.addEventListener(
+    "click",
+    (e) => {
+      if (e.ctrlKey) e.stopPropagation();
+    },
+    true,
+  );
   if (!isDesktop) {
     try {
       const res = await fetch("/api/auth/check");
