@@ -102,6 +102,7 @@ const progressPercent = computed(() => {
   if (!p || p.totalRows <= 0) return 0;
   return Math.min(100, Math.round((p.rowsImported / p.totalRows) * 100));
 });
+const currentStepIndex = computed(() => wizardSteps.findIndex((step) => step.value === wizardStep.value));
 const targetLabel = computed(() => {
   const pieces = [selectedConnection.value?.name, props.prefillDatabase, props.prefillSchema, props.prefillTable].filter(Boolean);
   return pieces.join(" / ");
@@ -269,6 +270,34 @@ function canOpenStep(step: TableImportWizardStep) {
   return false;
 }
 
+function wizardStepIndex(step: TableImportWizardStep) {
+  return wizardSteps.findIndex((item) => item.value === step);
+}
+
+function isWizardStepActive(step: TableImportWizardStep) {
+  return step === wizardStep.value;
+}
+
+function isWizardStepComplete(step: TableImportWizardStep) {
+  return wizardStepIndex(step) < currentStepIndex.value;
+}
+
+function wizardStepConnectorClass(index: number, leading: boolean) {
+  return (leading ? index <= currentStepIndex.value : index < currentStepIndex.value) ? "bg-primary/60" : "bg-border";
+}
+
+function wizardStepTextClass(step: TableImportWizardStep) {
+  if (isWizardStepActive(step)) return "text-foreground";
+  if (isWizardStepComplete(step)) return "text-foreground hover:bg-muted/40";
+  return "text-muted-foreground";
+}
+
+function wizardStepCircleClass(step: TableImportWizardStep) {
+  if (isWizardStepActive(step)) return "border-primary bg-primary text-primary-foreground shadow-sm";
+  if (isWizardStepComplete(step)) return "border-primary/70 bg-background text-primary";
+  return "border-border bg-background text-muted-foreground";
+}
+
 async function goNext() {
   if (wizardStep.value === "options" && !preview.value) {
     await loadPreview();
@@ -361,8 +390,8 @@ watch([sourceFormat, delimiter, hasHeader, trimValues, emptyStringAsNull, select
 
 <template>
   <Dialog v-model:open="open">
-    <DialogScrollContent class="sm:max-w-[980px] pt-12" :trap-focus="false" @interact-outside.prevent>
-      <DialogHeader>
+    <DialogScrollContent class="sm:max-w-[980px]" :trap-focus="false" @interact-outside.prevent>
+      <DialogHeader class="pr-8">
         <DialogTitle class="flex items-center gap-2 text-base">
           <FileUp class="h-4 w-4" />
           {{ t("tableImport.title") }}
@@ -370,26 +399,43 @@ watch([sourceFormat, delimiter, hasHeader, trimValues, emptyStringAsNull, select
       </DialogHeader>
 
       <div class="space-y-4 py-2">
-        <div class="grid grid-cols-[1fr_auto] gap-2">
+        <div class="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2">
           <input ref="fileInput" type="file" accept=".csv,.tsv,.txt,.json,.xlsx,.xlsm,.xls" class="hidden" @change="handleFileInputChange" />
-          <div class="min-w-0 rounded-md border bg-muted/20 px-3 py-2">
-            <div class="truncate text-xs text-muted-foreground">{{ t("tableImport.target") }}</div>
-            <div class="truncate text-sm font-medium">
+          <div class="flex h-10 min-w-0 items-center gap-2 rounded-md border bg-muted/20 px-3">
+            <span class="shrink-0 text-xs text-muted-foreground">{{ t("tableImport.target") }}</span>
+            <span class="min-w-0 truncate text-sm font-medium">
               {{ targetLabel || t("editor.noDatabase") }}
-            </div>
+            </span>
           </div>
-          <Button variant="outline" size="sm" :disabled="running || loadingPreview" @click="selectFile">
+          <Button variant="outline" class="h-10 px-3" :disabled="running || loadingPreview" @click="selectFile">
             <Loader2 v-if="loadingPreview" class="mr-1.5 h-3.5 w-3.5 animate-spin" />
             <Upload v-else class="mr-1.5 h-3.5 w-3.5" />
             {{ selectedSource ? t("tableImport.changeFile") : t("tableImport.selectFile") }}
           </Button>
         </div>
 
-        <div class="grid grid-cols-5 gap-1 rounded-md border bg-muted/20 p-1">
-          <button v-for="step in wizardSteps" :key="step.value" type="button" class="h-8 rounded px-2 text-xs font-medium" :class="wizardStep === step.value ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground'" :disabled="!canOpenStep(step.value)" @click="wizardStep = step.value">
-            {{ t(step.labelKey) }}
-          </button>
-        </div>
+        <nav class="rounded-md border bg-muted/20 px-3 py-2" :aria-label="t('tableImport.progress')">
+          <ol class="grid grid-cols-5">
+            <li v-for="(step, index) in wizardSteps" :key="step.value" class="relative flex min-w-0 justify-center">
+              <div v-if="index > 0" class="pointer-events-none absolute left-0 right-1/2 top-3.5 h-px" :class="wizardStepConnectorClass(index, true)" />
+              <div v-if="index < wizardSteps.length - 1" class="pointer-events-none absolute left-1/2 right-0 top-3.5 h-px" :class="wizardStepConnectorClass(index, false)" />
+              <button
+                type="button"
+                class="relative z-10 flex min-w-0 flex-col items-center gap-1 rounded-md px-2 py-1 text-xs font-medium transition-colors"
+                :class="[wizardStepTextClass(step.value), canOpenStep(step.value) ? 'cursor-pointer' : 'cursor-default']"
+                :disabled="!canOpenStep(step.value)"
+                :aria-current="isWizardStepActive(step.value) ? 'step' : undefined"
+                @click="wizardStep = step.value"
+              >
+                <span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-full border text-[11px] font-semibold" :class="wizardStepCircleClass(step.value)">
+                  <Check v-if="isWizardStepComplete(step.value)" class="h-3.5 w-3.5" />
+                  <span v-else>{{ index + 1 }}</span>
+                </span>
+                <span class="max-w-full truncate">{{ t(step.labelKey) }}</span>
+              </button>
+            </li>
+          </ol>
+        </nav>
 
         <div v-if="wizardStep === 'source'" class="space-y-4">
           <div class="rounded-md border border-dashed p-6 text-center">
