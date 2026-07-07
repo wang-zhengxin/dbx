@@ -1921,6 +1921,7 @@ export type TableImportJsonShape = "auto" | "objects" | "arrays";
 export interface TableImportColumnMapping {
   sourceColumn: string;
   targetColumn: string;
+  targetDataType?: string | null;
 }
 
 export interface TableImportParseOptions {
