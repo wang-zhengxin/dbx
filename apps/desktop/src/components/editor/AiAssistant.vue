@@ -15,6 +15,7 @@ import {
   Copy,
   Database,
   FileCode,
+  FlaskConical,
   GitBranch,
   HelpCircle,
   History,
@@ -123,6 +124,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   replaceSql: [sql: string];
   executeSql: [sql: string];
+  tempRunSql: [sql: string];
   requestAutoExecuteSql: [sql: string];
   openExplainPlan: [sql: string];
   close: [];
@@ -1516,8 +1518,11 @@ function applySql(code: string) {
 }
 
 function executeSql(code: string) {
-  emit("replaceSql", code);
   emit("executeSql", code);
+}
+
+function tempRunSql(code: string) {
+  emit("tempRunSql", code);
 }
 
 const copiedIndex = ref("");
@@ -1891,6 +1896,9 @@ async function openExternalUrl(url: string) {
                       <span>{{ seg.lang }}</span>
                       <span class="flex-1" />
                       <div class="flex items-center gap-1.5">
+                        <button v-if="seg.isSql" class="rounded p-0.5 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-700 dark:hover:text-zinc-200" :title="t('ai.tempRunSql')" @click="tempRunSql(seg.content)">
+                          <FlaskConical class="h-3.5 w-3.5" />
+                        </button>
                         <button v-if="seg.isSql" class="rounded p-0.5 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-700 dark:hover:text-zinc-200" :title="t('ai.executeSql')" @click="executeSql(seg.content)">
                           <Play class="h-3.5 w-3.5" />
                         </button>

@@ -1177,6 +1177,7 @@ export default withEnglishFallback({
     copySql: "複製 SQL",
     copyCode: "複製程式碼",
     executeSql: "立即執行",
+    tempRunSql: "臨時執行",
     copyAll: "複製全部",
     copied: "已複製",
     copyTestResult: "複製測試結果",

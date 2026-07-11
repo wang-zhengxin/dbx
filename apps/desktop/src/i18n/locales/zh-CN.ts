@@ -1235,6 +1235,7 @@ export default withEnglishFallback({
     copySql: "复制 SQL",
     copyCode: "复制代码",
     executeSql: "立即执行",
+    tempRunSql: "临时运行",
     copyAll: "复制全部",
     copied: "已复制",
     copyTestResult: "复制测试结果",

@@ -72,6 +72,7 @@ import {
 import { isPreviewTab } from "@/lib/tabs/tabPresentation";
 import { supportsSqlFileExecution } from "@/lib/database/databaseCapabilities";
 import { classifyAiSqlExecution } from "@/lib/ai/aiSqlExecutionPolicy";
+import { buildAppendedEditorSql } from "@/lib/ai/aiSqlAppend";
 import { buildHistoryAiAnalysisPrompt } from "@/lib/history/historyAiAnalysis";
 import { countAvailableAgentDriverUpdates, type AgentDriverUpdateBadgeState } from "@/lib/connection/agentDriverUpdateBadge";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
@@ -1250,16 +1251,25 @@ function onAiReplaceSql(sql: string) {
   queryStore.updateSql(tabId, sql);
 }
 
-function onAiExecuteSql(sql: string) {
-  const tabId = ensureQueryTab();
-  queryStore.updateSql(tabId, sql);
+function runAiGeneratedSql(sql: string) {
   selectedSql.value = "";
   nextTick(() => tryExecute(sql));
 }
 
+function onAiExecuteSql(sql: string) {
+  const tabId = ensureQueryTab();
+  queryStore.updateSql(tabId, buildAppendedEditorSql(activeTab.value?.sql || "", sql));
+  runAiGeneratedSql(sql);
+}
+
+function onAiTempRunSql(sql: string) {
+  ensureQueryTab();
+  runAiGeneratedSql(sql);
+}
+
 function onAiRequestAutoExecuteSql(sql: string) {
   const tabId = ensureQueryTab();
-  queryStore.updateSql(tabId, sql);
+  queryStore.updateSql(tabId, buildAppendedEditorSql(activeTab.value?.sql || "", sql));
   selectedSql.value = "";
 
   const decision = classifyAiSqlExecution(sql, activeConnection.value);
@@ -1281,7 +1291,7 @@ function onAiRequestAutoExecuteSql(sql: string) {
 
 function onAiOpenExplainPlan(sql: string) {
   const tabId = ensureQueryTab();
-  queryStore.updateSql(tabId, sql);
+  queryStore.updateSql(tabId, buildAppendedEditorSql(activeTab.value?.sql || "", sql));
   selectedSql.value = "";
   nextTick(() => {
     void tryExplain(sql);
@@ -1952,7 +1962,18 @@ onUnmounted(() => {
           <div v-if="showAiPanel" :class="isClassicLayout ? 'h-full shrink-0 relative z-30 isolate bg-background' : 'h-full shrink-0 relative z-30 isolate rounded-md border border-border/80 bg-background'" :style="{ width: aiPanelWidth + 'px' }">
             <div class="panel-resize-handle panel-resize-handle--left" @mousedown="startAiPanelResize" />
             <div class="h-full min-h-0 overflow-hidden">
-              <AiAssistant v-if="aiPanelReady" ref="aiAssistantRef" :tab="activeTab" :connection="activeConnection" @replace-sql="onAiReplaceSql" @execute-sql="onAiExecuteSql" @request-auto-execute-sql="onAiRequestAutoExecuteSql" @open-explain-plan="onAiOpenExplainPlan" @close="toggleAiPanel" />
+              <AiAssistant
+                v-if="aiPanelReady"
+                ref="aiAssistantRef"
+                :tab="activeTab"
+                :connection="activeConnection"
+                @replace-sql="onAiReplaceSql"
+                @execute-sql="onAiExecuteSql"
+                @temp-run-sql="onAiTempRunSql"
+                @request-auto-execute-sql="onAiRequestAutoExecuteSql"
+                @open-explain-plan="onAiOpenExplainPlan"
+                @close="toggleAiPanel"
+              />
             </div>
           </div>
 
