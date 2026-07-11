@@ -1110,7 +1110,7 @@ async function openObjectBrowser() {
     connectionStore.activeConnectionId = node.connectionId;
 
     if (hasTreeNodeDatabaseContext(node)) {
-      queryStore.openObjectBrowser(node.connectionId, node.database, node.schema);
+      queryStore.openObjectBrowser(node.connectionId, node.database, node.schema, node.catalog);
       return;
     }
 

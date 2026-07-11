@@ -102,12 +102,13 @@ type ObjectBrowserColumnKey = "select" | "name" | "type" | "estimatedRows" | "to
 const props = defineProps<{
   connection: ConnectionConfig;
   database: string;
+  catalog?: string;
   schema?: string;
   viewport?: ObjectBrowserViewport;
 }>();
 
 const emit = defineEmits<{
-  openTable: [target: { tableName: string; schema?: string; tableType?: string }];
+  openTable: [target: { tableName: string; schema?: string; tableType?: string; catalog?: string }];
   schemaChange: [schema: string | undefined];
   viewportChange: [viewport: ObjectBrowserViewport];
 }>();
@@ -712,7 +713,7 @@ function executeRowAction(row: ObjectBrowserRow, action: ObjectBrowserRowAction)
       void openTableInfo(row);
       break;
     case "open-table":
-      emit("openTable", { tableName: row.name, schema: row.schema });
+      emit("openTable", { tableName: row.name, schema: row.schema, catalog: props.catalog });
       break;
     case "open-source":
       void openSource(row);
@@ -1258,7 +1259,7 @@ async function saveFileContent(content: string, defaultFileName: string, filterN
 }
 
 function openViewData(row: ObjectBrowserRow) {
-  emit("openTable", { tableName: row.name, schema: row.schema, tableType: row.type });
+  emit("openTable", { tableName: row.name, schema: row.schema, tableType: row.type, catalog: props.catalog });
 }
 
 function openStructureEditor(row: ObjectBrowserRow) {
@@ -1903,7 +1904,7 @@ async function loadObjects() {
   rows.value = [];
   try {
     const schema = needsSchema.value ? selectedSchema.value || "" : props.database;
-    const objects: ObjectInfo[] = await api.listObjects(props.connection.id, props.database, schema);
+    const objects: ObjectInfo[] = await api.listObjects(props.connection.id, props.database, schema, undefined, undefined, undefined, undefined, props.catalog);
     if (id !== loadId) return;
     rows.value = buildObjectBrowserRows({
       objects,

@@ -1913,6 +1913,7 @@ onUnmounted(() => {
                           connectionId: activeTab.connectionId,
                           database: activeTab.database,
                           schema: target.schema,
+                          catalog: target.catalog,
                           tableName: target.tableName,
                           tableType: target.tableType,
                         })

@@ -752,6 +752,7 @@ export interface QueryTab {
   structureInitialTarget?: TableStructureEditorTarget;
   structureDraft?: TableStructureEditorDraft;
   objectBrowser?: {
+    catalog?: string;
     schema?: string;
     objectType?: "tables";
     viewport?: ObjectBrowserViewport;
