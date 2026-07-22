@@ -698,6 +698,19 @@ enum PreparedSelectOutcome {
     TextFallback { column_types: Vec<String>, unsupported_type: String },
 }
 
+fn prepared_select_metadata(
+    stmt: &tokio_postgres::Statement,
+) -> (Vec<String>, Vec<String>, Vec<PgColType>, Option<String>) {
+    let columns: Vec<String> = stmt.columns().iter().map(|c| c.name().to_string()).collect();
+    let column_types: Vec<String> = stmt.columns().iter().map(|c| c.type_().name().to_string()).collect();
+    let column_classes = classify_pg_column_types(&column_types);
+    let unsupported_type = stmt.columns().iter().zip(&column_classes).find_map(|(column, col_type)| {
+        let pg_type = column.type_();
+        pg_type_requires_text_protocol(pg_type.oid(), *col_type).then(|| pg_type.name().to_string())
+    });
+    (columns, column_types, column_classes, unsupported_type)
+}
+
 async fn execute_select_prepared(
     client: &deadpool_postgres::Client,
     sql: &str,
@@ -705,20 +718,23 @@ async fn execute_select_prepared(
     row_limit: usize,
 ) -> Result<PreparedSelectOutcome, tokio_postgres::Error> {
     let prepared_start = Instant::now();
-    let stmt = client.prepare_cached(sql).await?;
+    let mut stmt = client.prepare_cached(sql).await?;
     log::info!(
         "[postgres][select:prepare_cached:done] elapsed_ms={} total_ms={}",
         prepared_start.elapsed().as_millis(),
         start.elapsed().as_millis()
     );
-    let columns: Vec<String> = stmt.columns().iter().map(|c| c.name().to_string()).collect();
-    let column_types: Vec<String> = stmt.columns().iter().map(|c| c.type_().name().to_string()).collect();
-    let column_classes = classify_pg_column_types(&column_types);
-    if let Some(unsupported_type) = stmt.columns().iter().zip(&column_classes).find_map(|(column, col_type)| {
-        let pg_type = column.type_();
-        pg_type_requires_text_protocol(pg_type.oid(), *col_type).then(|| pg_type.name().to_string())
-    }) {
-        return Ok(PreparedSelectOutcome::TextFallback { column_types, unsupported_type });
+    let (mut columns, mut column_types, mut column_classes, cached_unsupported_type) = prepared_select_metadata(&stmt);
+    if cached_unsupported_type.is_some() {
+        stmt = client.prepare(sql).await?;
+        let (fresh_columns, fresh_column_types, fresh_column_classes, fresh_unsupported_type) =
+            prepared_select_metadata(&stmt);
+        columns = fresh_columns;
+        column_types = fresh_column_types;
+        column_classes = fresh_column_classes;
+        if let Some(unsupported_type) = fresh_unsupported_type {
+            return Ok(PreparedSelectOutcome::TextFallback { column_types, unsupported_type });
+        }
     }
 
     let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
@@ -781,13 +797,14 @@ async fn execute_select_text(
     row_limit: usize,
     prepared_column_types: Option<Vec<String>>,
 ) -> Result<QueryResult, String> {
-    let messages = client.simple_query(sql).await.map_err(pg_error_to_string)?;
+    let stream = client.simple_query_raw(sql).await.map_err(pg_error_to_string)?;
+    tokio::pin!(stream);
     let mut columns: Vec<String> = Vec::new();
     let mut result_rows: Vec<Vec<serde_json::Value>> = Vec::new();
     let mut truncated = false;
 
-    for message in messages {
-        match message {
+    while let Some(message) = stream.next().await {
+        match message.map_err(pg_error_to_string)? {
             SimpleQueryMessage::RowDescription(cols) => {
                 columns = cols.iter().map(|c| c.name().to_string()).collect();
             }
@@ -797,7 +814,7 @@ async fn execute_select_text(
                 }
                 if result_rows.len() >= row_limit {
                     truncated = true;
-                    continue;
+                    break;
                 }
                 let mut values = Vec::with_capacity(row.len());
                 for i in 0..row.len() {
@@ -3585,6 +3602,7 @@ mod tests {
 
     #[test]
     fn postgres_builtin_or_supported_type_keeps_binary_protocol() {
+        assert!(!pg_type_requires_text_protocol(POSTGRES_FIRST_NORMAL_OBJECT_ID - 1, PgColType::Other));
         assert!(!pg_type_requires_text_protocol(Type::INT4.oid(), PgColType::Other));
         assert!(!pg_type_requires_text_protocol(Type::VARCHAR.oid(), PgColType::Other));
         assert!(!pg_type_requires_text_protocol(98_765, PgColType::Vector));
@@ -3726,25 +3744,39 @@ mod tests {
         }
     }
 
+    async fn assert_postgres_18(pool: &Pool) {
+        let version = execute_query(pool, "SHOW server_version_num").await.expect("query PostgreSQL version");
+        let version_num = version.rows[0][0]
+            .as_str()
+            .expect("server_version_num should be text")
+            .parse::<u32>()
+            .expect("server_version_num should be numeric");
+        assert!((180_000..190_000).contains(&version_num), "expected PostgreSQL 18, got {version_num}");
+    }
+
     #[tokio::test]
     #[ignore = "requires DBX_TEST_POSTGRES_URL pointing at a writable PostgreSQL 18 database"]
     async fn postgres_custom_composite_result_uses_server_text_output() {
         let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("DBX_TEST_POSTGRES_URL");
         let pool = connect(&url, Duration::from_secs(5)).await.expect("connect postgres");
+        assert_postgres_18(&pool).await;
         let schema = format!("dbx_custom_text_{}", uuid::Uuid::new_v4().simple());
         let schema_ident = pg_quote_ident(&schema);
         let payload_type = format!("{schema_ident}.payload");
         execute_query(&pool, &format!("CREATE SCHEMA {schema_ident}")).await.expect("create schema");
-        execute_query(&pool, &format!("CREATE TYPE {payload_type} AS (id integer, label text)"))
-            .await
-            .expect("create composite type");
-        let custom =
-            execute_query(&pool, &format!("SELECT ROW(7, 'alpha')::{payload_type} AS payload, 42::int4 AS id"))
-                .await
-                .expect("query custom composite value");
-        let builtin = execute_query(&pool, "SELECT 42::int4 AS id").await.expect("query built-in value");
+        let exercise = async {
+            execute_query(&pool, &format!("CREATE TYPE {payload_type} AS (id integer, label text)")).await?;
+            let custom =
+                execute_query(&pool, &format!("SELECT ROW(7, 'alpha')::{payload_type} AS payload, 42::int4 AS id"))
+                    .await?;
+            let builtin = execute_query(&pool, "SELECT 42::int4 AS id").await?;
+            Ok::<_, String>((custom, builtin))
+        }
+        .await;
 
-        execute_query(&pool, &format!("DROP SCHEMA {schema_ident} CASCADE")).await.expect("drop schema");
+        let cleanup = execute_query(&pool, &format!("DROP SCHEMA {schema_ident} CASCADE")).await;
+        cleanup.expect("drop schema");
+        let (custom, builtin) = exercise.expect("exercise custom composite fallback");
 
         assert_eq!(custom.columns, vec!["payload", "id"]);
         assert_eq!(custom.column_types, vec!["payload", "int4"]);
@@ -3753,6 +3785,84 @@ mod tests {
         assert!(!custom.rows[0][0].as_str().unwrap().chars().any(char::is_control));
         assert_eq!(builtin.column_types, vec!["int4"]);
         assert_eq!(builtin.rows[0][0], serde_json::Value::Number(42.into()));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_TEST_POSTGRES_URL pointing at a writable PostgreSQL 18 database"]
+    async fn postgres_custom_type_fallback_refreshes_stale_cached_metadata() {
+        let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("DBX_TEST_POSTGRES_URL");
+        let pool_a = connect(&url, Duration::from_secs(5)).await.expect("connect postgres pool A");
+        let pool_b = connect(&url, Duration::from_secs(5)).await.expect("connect postgres pool B");
+        assert_postgres_18(&pool_a).await;
+        let schema = format!("dbx_custom_stale_{}", uuid::Uuid::new_v4().simple());
+        let schema_ident = pg_quote_ident(&schema);
+        let payload_type = format!("{schema_ident}.payload");
+        let view = format!("{schema_ident}.cached_payload");
+        let view_sql = format!("SELECT payload FROM {view}");
+        execute_query(&pool_a, &format!("CREATE SCHEMA {schema_ident}")).await.expect("create schema");
+
+        let exercise = async {
+            execute_query(&pool_a, &format!("CREATE TYPE {payload_type} AS (id integer, label text)")).await?;
+            execute_query(&pool_a, &format!("CREATE VIEW {view} AS SELECT ROW(7, 'alpha')::{payload_type} AS payload"))
+                .await?;
+            let custom = execute_query(&pool_a, &view_sql).await?;
+
+            execute_query(&pool_b, &format!("DROP VIEW {view}")).await?;
+            execute_query(&pool_b, &format!("CREATE VIEW {view} AS SELECT 42::int4 AS payload")).await?;
+            let builtin = execute_query(&pool_a, &view_sql).await?;
+            Ok::<_, String>((custom, builtin))
+        }
+        .await;
+
+        let cleanup = execute_query(&pool_a, &format!("DROP SCHEMA {schema_ident} CASCADE")).await;
+        cleanup.expect("drop schema");
+        let (custom, builtin) = exercise.expect("exercise stale cached custom metadata");
+        assert_eq!(custom.column_types, vec!["payload"]);
+        assert_eq!(custom.rows[0][0], serde_json::Value::String("(7,alpha)".to_string()));
+        assert_eq!(builtin.column_types, vec!["int4"]);
+        assert_eq!(builtin.rows[0][0], serde_json::Value::Number(42.into()));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_TEST_POSTGRES_URL pointing at a writable PostgreSQL 18 database"]
+    async fn postgres_text_fallback_stops_before_late_row_error_at_limit() {
+        let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("DBX_TEST_POSTGRES_URL");
+        let pool = connect(&url, Duration::from_secs(5)).await.expect("connect postgres");
+        assert_postgres_18(&pool).await;
+        let schema = format!("dbx_custom_limit_{}", uuid::Uuid::new_v4().simple());
+        let schema_ident = pg_quote_ident(&schema);
+        let payload_type = format!("{schema_ident}.payload");
+        let fail_after_two = format!("{schema_ident}.fail_after_two");
+        execute_query(&pool, &format!("CREATE SCHEMA {schema_ident}")).await.expect("create schema");
+
+        let exercise = async {
+            execute_query(&pool, &format!("CREATE TYPE {payload_type} AS (id integer)")).await?;
+            execute_query(
+                &pool,
+                &format!(
+                    "CREATE FUNCTION {fail_after_two}(i integer) RETURNS integer LANGUAGE plpgsql AS $$ \
+                     BEGIN IF i >= 3 THEN RAISE EXCEPTION 'late row failure'; END IF; RETURN i; END $$"
+                ),
+            )
+            .await?;
+            execute_query_with_max_rows(
+                &pool,
+                &format!(
+                    "SELECT ROW({fail_after_two}(i))::{payload_type} AS payload \
+                     FROM generate_series(1, 3) AS series(i)"
+                ),
+                Some(1),
+            )
+            .await
+        }
+        .await;
+
+        let cleanup = execute_query(&pool, &format!("DROP SCHEMA {schema_ident} CASCADE")).await;
+        cleanup.expect("drop schema");
+        let result = exercise.expect("query should stop before late row error");
+        assert_eq!(result.column_types, vec!["payload"]);
+        assert_eq!(result.rows, vec![vec![serde_json::Value::String("(1)".to_string())]]);
+        assert!(result.truncated);
     }
 
     fn state_enum_values(columns: &[ColumnInfo]) -> Option<Vec<String>> {
