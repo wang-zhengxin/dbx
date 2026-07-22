@@ -693,12 +693,17 @@ async fn postgres_query_one_cached(
     }
 }
 
+enum PreparedSelectOutcome {
+    Complete(QueryResult),
+    TextFallback { column_types: Vec<String>, unsupported_type: String },
+}
+
 async fn execute_select_prepared(
     client: &deadpool_postgres::Client,
     sql: &str,
     start: Instant,
     row_limit: usize,
-) -> Result<QueryResult, tokio_postgres::Error> {
+) -> Result<PreparedSelectOutcome, tokio_postgres::Error> {
     let prepared_start = Instant::now();
     let stmt = client.prepare_cached(sql).await?;
     log::info!(
@@ -709,6 +714,12 @@ async fn execute_select_prepared(
     let columns: Vec<String> = stmt.columns().iter().map(|c| c.name().to_string()).collect();
     let column_types: Vec<String> = stmt.columns().iter().map(|c| c.type_().name().to_string()).collect();
     let column_classes = classify_pg_column_types(&column_types);
+    if let Some(unsupported_type) = stmt.columns().iter().zip(&column_classes).find_map(|(column, col_type)| {
+        let pg_type = column.type_();
+        pg_type_requires_text_protocol(pg_type.oid(), *col_type).then(|| pg_type.name().to_string())
+    }) {
+        return Ok(PreparedSelectOutcome::TextFallback { column_types, unsupported_type });
+    }
 
     let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
     let query_start = Instant::now();
@@ -746,7 +757,7 @@ async fn execute_select_prepared(
         truncated
     );
 
-    Ok(QueryResult {
+    Ok(PreparedSelectOutcome::Complete(QueryResult {
         columns,
         column_types,
         column_sortables: Vec::new(),
@@ -756,7 +767,11 @@ async fn execute_select_prepared(
         truncated,
         session_id: None,
         has_more: false,
-    })
+    }))
+}
+
+fn matching_pg_text_column_types(columns: &[String], prepared: Option<Vec<String>>) -> Vec<String> {
+    prepared.filter(|types| types.len() == columns.len()).unwrap_or_default()
 }
 
 async fn execute_select_text(
@@ -764,6 +779,7 @@ async fn execute_select_text(
     sql: &str,
     start: Instant,
     row_limit: usize,
+    prepared_column_types: Option<Vec<String>>,
 ) -> Result<QueryResult, String> {
     let messages = client.simple_query(sql).await.map_err(pg_error_to_string)?;
     let mut columns: Vec<String> = Vec::new();
@@ -798,8 +814,8 @@ async fn execute_select_text(
     }
 
     Ok(QueryResult {
+        column_types: matching_pg_text_column_types(&columns, prepared_column_types),
         columns,
-        column_types: Vec::new(),
         column_sortables: Vec::new(),
         rows: result_rows,
         affected_rows: 0,
@@ -810,6 +826,25 @@ async fn execute_select_text(
     })
 }
 
+async fn finish_prepared_select(
+    client: &deadpool_postgres::Client,
+    sql: &str,
+    start: Instant,
+    row_limit: usize,
+    outcome: PreparedSelectOutcome,
+) -> Result<QueryResult, String> {
+    match outcome {
+        PreparedSelectOutcome::Complete(result) => Ok(result),
+        PreparedSelectOutcome::TextFallback { column_types, unsupported_type } => {
+            log::info!(
+                "[postgres][select:text_fallback] unsupported_type={} switching_to=simple_query",
+                unsupported_type
+            );
+            execute_select_text(client, sql, start, row_limit, Some(column_types)).await
+        }
+    }
+}
+
 async fn execute_select_query(
     client: &deadpool_postgres::Client,
     sql: &str,
@@ -817,7 +852,7 @@ async fn execute_select_query(
     row_limit: usize,
 ) -> Result<QueryResult, String> {
     match execute_select_prepared(client, sql, start, row_limit).await {
-        Ok(result) => Ok(result),
+        Ok(outcome) => finish_prepared_select(client, sql, start, row_limit, outcome).await,
         Err(err) if should_retry_postgres_stale_cache(&err) => {
             // The cached prepared statement is stale (e.g. the view or table
             // schema changed since the statement was prepared). Evict the
@@ -825,14 +860,16 @@ async fn execute_select_query(
             log::warn!("[postgres][select:stale_cache] evicting cached statement: {}", pg_error_to_string(err));
             client.statement_cache.remove(sql, &[]);
             match execute_select_prepared(client, sql, start, row_limit).await {
-                Ok(result) => Ok(result),
+                Ok(outcome) => finish_prepared_select(client, sql, start, row_limit, outcome).await,
                 Err(err) if should_retry_postgres_text_query(&err) => {
-                    execute_select_text(client, sql, start, row_limit).await
+                    execute_select_text(client, sql, start, row_limit, None).await
                 }
                 Err(err) => Err(pg_error_to_string(err)),
             }
         }
-        Err(err) if should_retry_postgres_text_query(&err) => execute_select_text(client, sql, start, row_limit).await,
+        Err(err) if should_retry_postgres_text_query(&err) => {
+            execute_select_text(client, sql, start, row_limit, None).await
+        }
         Err(err) => Err(pg_error_to_string(err)),
     }
 }
@@ -3562,6 +3599,21 @@ mod tests {
     }
 
     #[test]
+    fn postgres_text_fallback_keeps_matching_prepared_column_types() {
+        let columns = vec!["payload".to_string(), "id".to_string()];
+        let types = vec!["payload_type".to_string(), "int4".to_string()];
+        assert_eq!(matching_pg_text_column_types(&columns, Some(types.clone())), types);
+    }
+
+    #[test]
+    fn postgres_text_fallback_discards_misaligned_column_types() {
+        let columns = vec!["payload".to_string(), "id".to_string()];
+        let types = vec!["payload_type".to_string()];
+        assert!(matching_pg_text_column_types(&columns, Some(types)).is_empty());
+        assert!(matching_pg_text_column_types(&columns, None).is_empty());
+    }
+
+    #[test]
     fn classify_pg_type_covers_all_dispatch_branches() {
         assert_eq!(classify_pg_type("bytea"), PgColType::Bytea);
         assert_eq!(classify_pg_type("json"), PgColType::Json);
@@ -3672,6 +3724,35 @@ mod tests {
                 Err(error) => panic!("docker postgres did not become ready: {error}"),
             }
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_TEST_POSTGRES_URL pointing at a writable PostgreSQL 18 database"]
+    async fn postgres_custom_composite_result_uses_server_text_output() {
+        let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("DBX_TEST_POSTGRES_URL");
+        let pool = connect(&url, Duration::from_secs(5)).await.expect("connect postgres");
+        let schema = format!("dbx_custom_text_{}", uuid::Uuid::new_v4().simple());
+        let schema_ident = pg_quote_ident(&schema);
+        let payload_type = format!("{schema_ident}.payload");
+        execute_query(&pool, &format!("CREATE SCHEMA {schema_ident}")).await.expect("create schema");
+        execute_query(&pool, &format!("CREATE TYPE {payload_type} AS (id integer, label text)"))
+            .await
+            .expect("create composite type");
+        let custom =
+            execute_query(&pool, &format!("SELECT ROW(7, 'alpha')::{payload_type} AS payload, 42::int4 AS id"))
+                .await
+                .expect("query custom composite value");
+        let builtin = execute_query(&pool, "SELECT 42::int4 AS id").await.expect("query built-in value");
+
+        execute_query(&pool, &format!("DROP SCHEMA {schema_ident} CASCADE")).await.expect("drop schema");
+
+        assert_eq!(custom.columns, vec!["payload", "id"]);
+        assert_eq!(custom.column_types, vec!["payload", "int4"]);
+        assert_eq!(custom.rows[0][0], serde_json::Value::String("(7,alpha)".to_string()));
+        assert_eq!(custom.rows[0][1], serde_json::Value::String("42".to_string()));
+        assert!(!custom.rows[0][0].as_str().unwrap().chars().any(char::is_control));
+        assert_eq!(builtin.column_types, vec!["int4"]);
+        assert_eq!(builtin.rows[0][0], serde_json::Value::Number(42.into()));
     }
 
     fn state_enum_values(columns: &[ColumnInfo]) -> Option<Vec<String>> {
