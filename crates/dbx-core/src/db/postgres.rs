@@ -804,11 +804,11 @@ async fn execute_select_text(
     let mut truncated = false;
 
     while let Some(message) = stream.next().await {
-        match message.map_err(pg_error_to_string)? {
-            SimpleQueryMessage::RowDescription(cols) => {
+        match message {
+            Ok(SimpleQueryMessage::RowDescription(cols)) => {
                 columns = cols.iter().map(|c| c.name().to_string()).collect();
             }
-            SimpleQueryMessage::Row(row) => {
+            Ok(SimpleQueryMessage::Row(row)) => {
                 if columns.is_empty() {
                     columns = row.columns().iter().map(|c| c.name().to_string()).collect();
                 }
@@ -825,8 +825,13 @@ async fn execute_select_text(
                 }
                 result_rows.push(values);
             }
-            SimpleQueryMessage::CommandComplete(_) => {}
-            _ => {}
+            Err(_) if result_rows.len() >= row_limit => {
+                truncated = true;
+                break;
+            }
+            Err(err) => return Err(pg_error_to_string(err)),
+            Ok(SimpleQueryMessage::CommandComplete(_)) => {}
+            Ok(_) => {}
         }
     }
 
@@ -3841,28 +3846,32 @@ mod tests {
                 &pool,
                 &format!(
                     "CREATE FUNCTION {fail_after_two}(i integer) RETURNS integer LANGUAGE plpgsql AS $$ \
-                     BEGIN IF i >= 3 THEN RAISE EXCEPTION 'late row failure'; END IF; RETURN i; END $$"
+                     BEGIN IF i >= 2 THEN RAISE EXCEPTION 'late row failure'; END IF; RETURN i; END $$"
                 ),
             )
             .await?;
-            execute_query_with_max_rows(
-                &pool,
-                &format!(
-                    "SELECT ROW({fail_after_two}(i))::{payload_type} AS payload \
-                     FROM generate_series(1, 3) AS series(i)"
-                ),
-                Some(1),
-            )
-            .await
+            let client = checkout_postgres_client(&pool, None, Duration::from_secs(5)).await?;
+            let custom_sql = format!(
+                "SELECT ROW({fail_after_two}(i))::{payload_type} AS payload \
+                 FROM generate_series(1, 2) AS series(i)"
+            );
+            let limited = execute_select_query(&client, &custom_sql, Instant::now(), 1).await;
+            let recovery = execute_select_query(&client, "SELECT 1::int4 AS value", Instant::now(), 1).await;
+            drop(client);
+            Ok::<_, String>((limited, recovery))
         }
         .await;
 
         let cleanup = execute_query(&pool, &format!("DROP SCHEMA {schema_ident} CASCADE")).await;
         cleanup.expect("drop schema");
-        let result = exercise.expect("query should stop before late row error");
-        assert_eq!(result.column_types, vec!["payload"]);
-        assert_eq!(result.rows, vec![vec![serde_json::Value::String("(1)".to_string())]]);
-        assert!(result.truncated);
+        let (limited, recovery) = exercise.expect("set up late row error query");
+        let limited = limited.expect("query should stop before late row error");
+        let recovery = recovery.expect("connection should remain reusable");
+        assert_eq!(limited.column_types, vec!["payload"]);
+        assert_eq!(limited.rows, vec![vec![serde_json::Value::String("(1)".to_string())]]);
+        assert!(limited.truncated);
+        assert_eq!(recovery.column_types, vec!["int4"]);
+        assert_eq!(recovery.rows[0][0], serde_json::Value::Number(1.into()));
     }
 
     fn state_enum_values(columns: &[ColumnInfo]) -> Option<Vec<String>> {

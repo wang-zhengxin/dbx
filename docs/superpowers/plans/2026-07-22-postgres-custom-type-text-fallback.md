@@ -4,9 +4,9 @@
 
 **目标：** 当 PostgreSQL 查询包含 DBX 不支持其二进制格式的扩展或用户自定义标量类型时，在执行前切换到服务器文本协议，并保留查询列类型元数据。
 
-**架构：** `execute_select_prepared` 仍先准备语句并检查输出列的 OID 与现有 `PgColType` 分类；普通对象 OID 且分类为 `Other` 的列返回内部 `TextFallback` 结果，不调用 `query_raw`。`execute_select_query` 消费该结果并调用现有 `simple_query` 路径，同时把准备阶段取得的列类型名称传给文本结果。
+**架构：** `execute_select_prepared` 仍先准备语句并检查输出列的 OID 与现有 `PgColType` 分类；普通对象 OID 且分类为 `Other` 的列会先用非缓存 prepare 复核元数据，再返回内部 `TextFallback` 结果，不调用 `query_raw`。`execute_select_query` 消费该结果并调用 `simple_query_raw` 文本流，同时把准备阶段取得的列类型名称传给文本结果。
 
-**技术栈：** Rust、Tokio、deadpool-postgres、tokio-postgres、serde_json、内置单元测试、Docker PostgreSQL 集成测试
+**技术栈：** Rust、Tokio、deadpool-postgres、tokio-postgres、serde_json、内置单元测试、外部 PostgreSQL 18 ignored 集成测试
 
 ---
 
@@ -154,55 +154,47 @@ cargo test -p dbx-core postgres_text_fallback_ --lib
 
 预期：两个元数据测试通过。
 
-- [ ] **步骤 4：编写真实 PostgreSQL 回归测试并验证 RED**
+- [ ] **步骤 4：编写 PostgreSQL 18 回归测试并验证 RED**
 
-在现有 Docker PostgreSQL 测试附近加入：
+测试使用调用方通过 `DBX_TEST_POSTGRES_URL` 注入的可写 PostgreSQL 18 实例，不在源码、命令或日志中保存连接地址和凭据。每个测试先执行 `SHOW server_version_num` 并确认版本在 `180000..190000`，使用 UUID 创建唯一 schema，并在 unwrap/断言前执行 `DROP SCHEMA ... CASCADE`。
+
+加入三个 `#[ignore = "requires DBX_TEST_POSTGRES_URL pointing at a writable PostgreSQL 18 database"]` 回归测试：
+
+- `postgres_custom_composite_result_uses_server_text_output`：自定义 composite 通过服务器文本输出返回 `(7,alpha)`，同查询内建值为文本，纯内建查询仍为 JSON Number。
+- `postgres_custom_type_fallback_refreshes_stale_cached_metadata`：pool A 缓存 custom view 元数据，pool B 将同名 view 改成 `int4`，pool A 重查必须使用 fresh metadata 并返回 JSON Number。
+- `postgres_text_fallback_stops_before_late_row_error_at_limit`：custom 查询在第 N+1 行直接报错，`row_limit=1` 必须返回首行并标记 truncated；同一 client 随后的内建查询必须成功。
+
+核心测试结构如下：
 
 ```rust
 #[tokio::test]
+#[ignore = "requires DBX_TEST_POSTGRES_URL pointing at a writable PostgreSQL 18 database"]
 async fn postgres_custom_composite_result_uses_server_text_output() {
-    let Some(container) = start_docker_postgres().await else {
-        return;
-    };
-
-    let pool = connect(&container.url(), Duration::from_secs(5)).await.expect("connect postgres");
-    let schema = format!("dbx_custom_text_{}", std::process::id());
+    let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("DBX_TEST_POSTGRES_URL");
+    let pool = connect(&url, Duration::from_secs(5)).await.expect("connect postgres");
+    assert_postgres_18(&pool).await;
+    let schema = format!("dbx_custom_text_{}", uuid::Uuid::new_v4().simple());
     let schema_ident = pg_quote_ident(&schema);
     let payload_type = format!("{schema_ident}.payload");
 
-    execute_query(&pool, &format!("CREATE SCHEMA {schema_ident}"))
-        .await
-        .expect("create schema");
-    execute_query(&pool, &format!("CREATE TYPE {payload_type} AS (id integer, label text)"))
-        .await
-        .expect("create composite type");
-
-    let custom = execute_query(
-        &pool,
-        &format!("SELECT ROW(7, 'alpha')::{payload_type} AS payload, 42::int4 AS id"),
-    )
-    .await
-    .expect("query custom composite value");
-
-    assert_eq!(custom.columns, vec!["payload", "id"]);
-    assert_eq!(custom.column_types, vec!["payload", "int4"]);
-    assert_eq!(custom.rows[0][0], serde_json::Value::String("(7,alpha)".to_string()));
-    assert_eq!(custom.rows[0][1], serde_json::Value::String("42".to_string()));
-    assert!(!custom.rows[0][0].as_str().unwrap().chars().any(char::is_control));
-
-    let builtin = execute_query(&pool, "SELECT 42::int4 AS id").await.expect("query built-in value");
-    assert_eq!(builtin.column_types, vec!["int4"]);
-    assert_eq!(builtin.rows[0][0], serde_json::Value::Number(42.into()));
+    execute_query(&pool, &format!("CREATE SCHEMA {schema_ident}")).await.expect("create schema");
+    let exercise = async { /* create type and run custom/builtin queries */ }.await;
+    let cleanup = execute_query(&pool, &format!("DROP SCHEMA {schema_ident} CASCADE")).await;
+    cleanup.expect("drop schema");
+    let (custom, builtin) = exercise.expect("exercise custom composite fallback");
+    // Assertions run only after cleanup.
 }
 ```
 
 运行：
 
 ```bash
-cargo test -p dbx-core postgres_custom_composite_result_uses_server_text_output --lib -- --nocapture
+env DBX_TEST_POSTGRES_URL="$DBX_TEST_POSTGRES_URL" cargo test -p dbx-core postgres_custom_composite_result_uses_server_text_output --lib -- --ignored --nocapture
+env DBX_TEST_POSTGRES_URL="$DBX_TEST_POSTGRES_URL" cargo test -p dbx-core postgres_custom_type_fallback_refreshes_stale_cached_metadata --lib -- --ignored --nocapture
+env DBX_TEST_POSTGRES_URL="$DBX_TEST_POSTGRES_URL" cargo test -p dbx-core postgres_text_fallback_stops_before_late_row_error_at_limit --lib -- --ignored --nocapture
 ```
 
-预期：Docker 可用时 FAIL，`payload` 单元格不是 `(7,alpha)` 或仍含二进制控制内容。Docker 不可用时先继续单元测试实现，最终必须使用报告数据库补足端到端验收。
+预期 RED：原始实现分别暴露自定义值的二进制控制内容、陈旧 custom metadata，以及第 N+1 行范围外错误。不得把缺少环境变量、连接失败或版本不符当作 RED。
 
 - [ ] **步骤 5：实现准备查询结果类型**
 
@@ -231,6 +223,8 @@ if let Some(unsupported_type) = stmt.columns().iter().zip(&column_classes).find_
     return Ok(PreparedSelectOutcome::TextFallback { column_types, unsupported_type });
 }
 ```
+
+cached prepare 首次命中自定义类型候选时，必须在执行 SQL 前调用一次 `client.prepare(sql)` 做非缓存复核，并以 fresh statement 的 columns、types 和 classes 替换缓存元数据。fresh 仍为不支持的 custom 类型时返回 `TextFallback`；fresh 已为 built-in 时使用 fresh statement 进入 `query_raw`。这避免陈旧 custom metadata 绕过 stale-plan 错误，同时保证 SQL 只执行一次。
 
 原函数末尾返回改为：
 
@@ -261,6 +255,8 @@ async fn execute_select_text(
     prepared_column_types: Option<Vec<String>>,
 ) -> Result<QueryResult, String>
 ```
+
+文本路径使用 `client.simple_query_raw(sql)` 并逐消息消费。在 `Ok(Row)` 到达且已达 row limit 时标记 `truncated` 后退出；若第 N+1 条消息直接是 `Err`，同样标记 `truncated` 后退出，只有未达 limit 的错误才向上传播。`CommandComplete` 不得让“恰好等于 limit”被误标为 truncated。
 
 在构造 `QueryResult` 前计算并返回类型列表：
 
@@ -322,10 +318,12 @@ cargo test -p dbx-core postgres_text_fallback_ --lib
 cargo test -p dbx-core postgres_custom_other_type_requires_text_protocol --lib
 cargo test -p dbx-core postgres_builtin_or_supported_type_keeps_binary_protocol --lib
 cargo test -p dbx-core postgres_query_uses_text_when_any_output_type_is_unsupported --lib
-cargo test -p dbx-core postgres_custom_composite_result_uses_server_text_output --lib -- --nocapture
+env DBX_TEST_POSTGRES_URL="$DBX_TEST_POSTGRES_URL" cargo test -p dbx-core postgres_custom_composite_result_uses_server_text_output --lib -- --ignored --nocapture
+env DBX_TEST_POSTGRES_URL="$DBX_TEST_POSTGRES_URL" cargo test -p dbx-core postgres_custom_type_fallback_refreshes_stale_cached_metadata --lib -- --ignored --nocapture
+env DBX_TEST_POSTGRES_URL="$DBX_TEST_POSTGRES_URL" cargo test -p dbx-core postgres_text_fallback_stops_before_late_row_error_at_limit --lib -- --ignored --nocapture
 ```
 
-预期：所有目标单元测试通过；Docker 可用时集成测试通过，并断言自定义复合类型为服务器文本 `(7,alpha)`、纯内置查询仍返回数字 JSON。
+预期：所有目标单元测试通过；三个 PostgreSQL 18 ignored 测试通过，并分别覆盖服务器文本输出、陈旧元数据刷新和 N+1 范围外错误；纯内置查询仍返回数字 JSON。
 
 - [ ] **步骤 8：提交协议编排和回归测试**
 
@@ -357,9 +355,12 @@ git diff origin/main --check
 
 ```bash
 cargo test -p dbx-core db::postgres::tests --lib
+env DBX_TEST_POSTGRES_URL="$DBX_TEST_POSTGRES_URL" cargo test -p dbx-core postgres_custom_composite_result_uses_server_text_output --lib -- --ignored --nocapture
+env DBX_TEST_POSTGRES_URL="$DBX_TEST_POSTGRES_URL" cargo test -p dbx-core postgres_custom_type_fallback_refreshes_stale_cached_metadata --lib -- --ignored --nocapture
+env DBX_TEST_POSTGRES_URL="$DBX_TEST_POSTGRES_URL" cargo test -p dbx-core postgres_text_fallback_stops_before_late_row_error_at_limit --lib -- --ignored --nocapture
 ```
 
-预期：全部通过；Docker 不可用导致的辅助测试跳过需在结果中单独说明。
+预期：单元测试和三个 PostgreSQL 18 ignored 测试全部通过。若 `DBX_TEST_POSTGRES_URL` 未提供，则必须明确报告集成测试未运行，不得把 ignored 状态视为通过。
 
 - [ ] **步骤 3：运行 crate 检查**
 
