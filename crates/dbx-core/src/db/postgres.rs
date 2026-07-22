@@ -338,6 +338,12 @@ pub(crate) enum PgColType {
     Other,
 }
 
+const POSTGRES_FIRST_NORMAL_OBJECT_ID: u32 = 16_384;
+
+fn pg_type_requires_text_protocol(oid: u32, col_type: PgColType) -> bool {
+    oid >= POSTGRES_FIRST_NORMAL_OBJECT_ID && matches!(col_type, PgColType::Other)
+}
+
 pub(crate) fn classify_pg_type(type_name: &str) -> PgColType {
     let upper = type_name.to_uppercase();
 
@@ -3533,6 +3539,27 @@ mod tests {
     use std::process::Command;
     use std::time::Instant;
     use tokio_postgres::types::FromSql;
+
+    #[test]
+    fn postgres_custom_other_type_requires_text_protocol() {
+        assert!(pg_type_requires_text_protocol(POSTGRES_FIRST_NORMAL_OBJECT_ID, PgColType::Other));
+        assert!(pg_type_requires_text_protocol(98_765, PgColType::Other));
+    }
+
+    #[test]
+    fn postgres_builtin_or_supported_type_keeps_binary_protocol() {
+        assert!(!pg_type_requires_text_protocol(Type::INT4.oid(), PgColType::Other));
+        assert!(!pg_type_requires_text_protocol(Type::VARCHAR.oid(), PgColType::Other));
+        assert!(!pg_type_requires_text_protocol(98_765, PgColType::Vector));
+        assert!(!pg_type_requires_text_protocol(98_765, PgColType::Geometry));
+    }
+
+    #[test]
+    fn postgres_query_uses_text_when_any_output_type_is_unsupported() {
+        let columns =
+            [(Type::INT4.oid(), PgColType::Other), (98_765, PgColType::Other), (Type::TEXT.oid(), PgColType::Other)];
+        assert!(columns.into_iter().any(|(oid, col_type)| pg_type_requires_text_protocol(oid, col_type)));
+    }
 
     #[test]
     fn classify_pg_type_covers_all_dispatch_branches() {
