@@ -1801,6 +1801,9 @@ pub fn format_grid_sql_literal(
         let escaped_text = literal_text.replace('\\', "\\\\").replace('\'', "''");
         return format!("E'{escaped_text}'");
     }
+    if database_type == Some(DatabaseType::SqlServer) {
+        return format_sqlserver_unicode_literal(&literal_text);
+    }
     let escaped_text = if database_type == Some(DatabaseType::Neo4j) {
         literal_text.replace('\\', "\\\\").replace('\'', "\\'")
     } else if is_sqlite_literal_database(database_type) {
@@ -1811,10 +1814,39 @@ pub fn format_grid_sql_literal(
         literal_text.replace('\\', "\\\\").replace('\'', "''")
     };
     let escaped = format!("'{escaped_text}'");
-    if database_type == Some(DatabaseType::SqlServer) {
-        format!("N{escaped}")
+    escaped
+}
+
+fn format_sqlserver_unicode_literal(text: &str) -> String {
+    let mut parts = Vec::new();
+    let mut segment = String::new();
+
+    for ch in text.chars() {
+        let line_break = match ch {
+            '\r' => Some(13),
+            '\n' => Some(10),
+            _ => None,
+        };
+        if let Some(codepoint) = line_break {
+            if !segment.is_empty() {
+                parts.push(format!("N'{}'", segment.replace('\'', "''")));
+                segment.clear();
+            }
+            // Keep physical newlines out of generated SQL so a preceding
+            // backslash cannot be consumed as a line-continuation marker.
+            parts.push(format!("NCHAR({codepoint})"));
+        } else {
+            segment.push(ch);
+        }
+    }
+
+    if !segment.is_empty() {
+        parts.push(format!("N'{}'", segment.replace('\'', "''")));
+    }
+    if parts.is_empty() {
+        "N''".to_string()
     } else {
-        escaped
+        parts.join(" + ")
     }
 }
 
@@ -4793,6 +4825,55 @@ mod tests {
             );
             assert_eq!(format_grid_sql_literal(&json!("it's"), Some(database_type), None), "'it''s'");
         }
+    }
+
+    #[test]
+    fn sqlserver_literals_do_not_double_escape_backslashes() {
+        assert_eq!(format_grid_sql_literal(&json!(r".\SQL2016"), Some(DatabaseType::SqlServer), None), r"N'.\SQL2016'");
+        assert_eq!(
+            format_grid_sql_literal(&json!(r".\SQL2016's"), Some(DatabaseType::SqlServer), None),
+            r"N'.\SQL2016''s'"
+        );
+    }
+
+    #[test]
+    fn sqlserver_literals_preserve_backslashes_before_line_breaks() {
+        assert_eq!(
+            format_grid_sql_literal(&json!("line1\\\nline2"), Some(DatabaseType::SqlServer), None),
+            r"N'line1\' + NCHAR(10) + N'line2'"
+        );
+        assert_eq!(
+            format_grid_sql_literal(&json!("line1\\\r\nline2"), Some(DatabaseType::SqlServer), None),
+            r"N'line1\' + NCHAR(13) + NCHAR(10) + N'line2'"
+        );
+    }
+
+    #[test]
+    fn prepares_sqlserver_updates_without_doubling_backslashes() {
+        let result = prepare_data_grid_save(DataGridSaveStatementOptions {
+            database_type: Some(DatabaseType::SqlServer),
+            identifier_quote: None,
+            table_meta: DataGridTableMeta {
+                catalog: None,
+                database: None,
+                schema: Some("dbo".to_string()),
+                table_name: "dbx_issue_4181".to_string(),
+                primary_keys: vec!["id".to_string()],
+                columns: Some(vec![column("id", "int", false, None), column("value", "nvarchar(100)", true, None)]),
+            },
+            columns: vec!["id".to_string(), "value".to_string()],
+            source_columns: None,
+            rows: vec![vec![json!(1), json!("initial")]],
+            dirty_rows: vec![(0, vec![(1, json!(r".\SQL2016"))])],
+            deleted_rows: vec![],
+            new_rows: vec![],
+        });
+
+        assert_eq!(result.validation_error, None);
+        assert_eq!(
+            result.statements,
+            vec![r"UPDATE [dbo].[dbx_issue_4181] SET [value] = N'.\SQL2016' WHERE [id] = 1;"]
+        );
     }
 
     #[test]
