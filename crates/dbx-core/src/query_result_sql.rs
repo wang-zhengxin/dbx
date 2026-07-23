@@ -8,7 +8,7 @@ use crate::sql_dialect::{
     firebird_rows_clause, pagination_strategy, quote_table_identifier, PaginationContext, TablePaginationStrategy,
 };
 use sqlparser::ast::{Expr, GroupByExpr, SelectItem, SetExpr, Statement};
-use sqlparser::dialect::{GenericDialect, MsSqlDialect};
+use sqlparser::dialect::{ClickHouseDialect, GenericDialect, MsSqlDialect};
 use sqlparser::parser::Parser;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1015,10 +1015,7 @@ fn add_outer_standard_limit(
 
 fn add_clickhouse_limit(statement: &str, limit_sql: &str) -> String {
     let limit_sql = limit_sql.trim();
-    let settings_index = top_level_sql_tokens(statement)
-        .iter()
-        .find(|token| token.text == "SETTINGS" && !is_qualified_identifier_part(statement, token))
-        .map(|token| token.start);
+    let settings_index = clickhouse_settings_clause_index(statement);
 
     if let Some(index) = settings_index {
         let statement_before_settings = statement[..index].trim_end();
@@ -1027,6 +1024,25 @@ fn add_clickhouse_limit(statement: &str, limit_sql: &str) -> String {
     }
 
     append_sql_suffix(statement, &format!("{limit_sql};"))
+}
+
+fn clickhouse_settings_clause_index(statement: &str) -> Option<usize> {
+    let parsed_settings = Parser::parse_sql(&ClickHouseDialect {}, statement).ok().and_then(|statements| {
+        let [Statement::Query(query)] = statements.as_slice() else {
+            return None;
+        };
+        Some(query.settings.is_some())
+    });
+    if parsed_settings == Some(false) {
+        return None;
+    }
+
+    // Keep the lexical fallback for valid ClickHouse syntax that sqlparser does not yet support.
+    top_level_sql_tokens(statement)
+        .iter()
+        .rev()
+        .find(|token| token.text == "SETTINGS" && !is_qualified_identifier_part(statement, token))
+        .map(|token| token.start)
 }
 
 fn is_qualified_identifier_part(sql: &str, token: &SqlToken) -> bool {
@@ -1837,6 +1853,35 @@ WHERE u.id = picked.id;
 
         assert!(result.ok);
         assert_eq!(result.sql.unwrap(), "SELECT * FROM system.settings LIMIT 100;");
+    }
+
+    #[test]
+    fn clickhouse_settings_identifier_is_not_treated_as_settings_clause() {
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: "SELECT settings FROM (SELECT 1 AS settings)".to_string(),
+            database_type: Some(DatabaseType::ClickHouse),
+            limit: 100,
+            offset: 0,
+        });
+
+        assert!(result.ok);
+        assert_eq!(result.sql.unwrap(), "SELECT settings FROM (SELECT 1 AS settings) LIMIT 100;");
+    }
+
+    #[test]
+    fn clickhouse_settings_identifier_keeps_trailing_settings_clause() {
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: "SELECT settings FROM (SELECT 1 AS settings) SETTINGS max_threads = 1".to_string(),
+            database_type: Some(DatabaseType::ClickHouse),
+            limit: 100,
+            offset: 0,
+        });
+
+        assert!(result.ok);
+        assert_eq!(
+            result.sql.unwrap(),
+            "SELECT settings FROM (SELECT 1 AS settings) LIMIT 100 SETTINGS max_threads = 1;"
+        );
     }
 
     #[test]
