@@ -1015,8 +1015,10 @@ fn add_outer_standard_limit(
 
 fn add_clickhouse_limit(statement: &str, limit_sql: &str) -> String {
     let limit_sql = limit_sql.trim();
-    let settings_index =
-        top_level_sql_tokens(statement).iter().find(|token| token.text == "SETTINGS").map(|token| token.start);
+    let settings_index = top_level_sql_tokens(statement)
+        .iter()
+        .find(|token| token.text == "SETTINGS" && !is_qualified_identifier_part(statement, token))
+        .map(|token| token.start);
 
     if let Some(index) = settings_index {
         let statement_before_settings = statement[..index].trim_end();
@@ -1025,6 +1027,12 @@ fn add_clickhouse_limit(statement: &str, limit_sql: &str) -> String {
     }
 
     append_sql_suffix(statement, &format!("{limit_sql};"))
+}
+
+fn is_qualified_identifier_part(sql: &str, token: &SqlToken) -> bool {
+    let token_end = token.start + token.text.len();
+    sql[..token.start].chars().rev().find(|ch| !ch.is_whitespace()) == Some('.')
+        || sql[token_end..].chars().find(|ch| !ch.is_whitespace()) == Some('.')
 }
 
 fn derived_table_sql(prefix: &str, statement: &str, suffix: &str) -> String {
@@ -1816,6 +1824,19 @@ WHERE u.id = picked.id;
             result.sql.unwrap(),
             "SELECT * FROM system.clusters LIMIT 50 OFFSET 100 SETTINGS max_execution_time = 0;"
         );
+    }
+
+    #[test]
+    fn clickhouse_settings_table_is_not_treated_as_settings_clause() {
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: "SELECT * FROM system.settings".to_string(),
+            database_type: Some(DatabaseType::ClickHouse),
+            limit: 100,
+            offset: 0,
+        });
+
+        assert!(result.ok);
+        assert_eq!(result.sql.unwrap(), "SELECT * FROM system.settings LIMIT 100;");
     }
 
     #[test]
