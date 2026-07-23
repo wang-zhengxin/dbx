@@ -85,7 +85,7 @@ import { countAvailableAgentDriverUpdates, type AgentDriverUpdateBadgeState } fr
 import type { DriverStoreFocus } from "@/lib/connection/agentDriverInstallHint";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
 import { apiUrl, webPath } from "@/lib/common/webPath";
-import { APP_FONT_SANS_CSS_VAR, DEFAULT_UI_FONT_FAMILY } from "@/lib/app/appFonts";
+import { APP_FONT_SANS_CSS_VAR, DATA_GRID_FONT_FAMILY_CSS_VAR, DEFAULT_DATA_GRID_FONT_FAMILY, DEFAULT_UI_FONT_FAMILY } from "@/lib/app/appFonts";
 import { rankSavedSqlHistory } from "@/lib/savedSql/savedSqlHistory";
 import { countActiveUpdateBlockingTasks } from "@/lib/app/appUpdateTaskGuard";
 import { initSavedSqlEditorPositions } from "@/lib/app/savedSqlEditorPosition";
@@ -503,6 +503,11 @@ function applyUiFontFamily(fontFamily: string) {
   document.body.style.fontFamily = `var(${APP_FONT_SANS_CSS_VAR}, ${DEFAULT_UI_FONT_FAMILY})`;
 }
 
+function applyDataGridFontFamily(fontFamily: string) {
+  if (typeof document === "undefined") return;
+  document.documentElement.style.setProperty(DATA_GRID_FONT_FAMILY_CSS_VAR, fontFamily || DEFAULT_DATA_GRID_FONT_FAMILY);
+}
+
 const appUiFontFamilyStyle = computed<Record<string, string>>(() => {
   const fontFamily = settingsStore.editorSettings.uiFontFamily || DEFAULT_UI_FONT_FAMILY;
   return {
@@ -560,6 +565,14 @@ watch(
   () => settingsStore.editorSettings.uiFontFamily,
   (fontFamily) => {
     applyUiFontFamily(fontFamily);
+  },
+  { immediate: true },
+);
+
+watch(
+  () => settingsStore.editorSettings.tableFontFamily,
+  (fontFamily) => {
+    applyDataGridFontFamily(fontFamily);
   },
   { immediate: true },
 );

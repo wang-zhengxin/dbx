@@ -23,7 +23,7 @@
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs { inherit system overlays; };
 
-        # Rust toolchain — lock to the minimum required version (1.77)
+        # Rust toolchain — lock to the minimum required version (1.88)
         # while allowing newer stable releases to satisfy all crate deps.
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           extensions = [
@@ -170,7 +170,7 @@
         # ------------------------------------------------------------------ #
         packages.dbx-desktop = pkgs.stdenv.mkDerivation (finalAttrs: {
           pname = "dbx-desktop";
-          version = "0.5.63";
+          version = "0.5.64";
 
           src = pkgs.lib.cleanSource ./.;
 

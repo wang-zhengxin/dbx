@@ -750,6 +750,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(feature = "mq-admin")]
     #[tokio::test]
     async fn save_connections_drops_cached_mq_adapter_for_updated_config() {
         let (state, dir) = test_web_state().await;

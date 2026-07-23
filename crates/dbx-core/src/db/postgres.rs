@@ -26,8 +26,8 @@ use crate::sql::starts_with_executable_sql_keyword;
 use crate::types::{
     ColumnInfo, CompletionAssistantCandidate, CompletionAssistantCandidateKind, CompletionAssistantMatchMode,
     CompletionAssistantObjectKind, CompletionAssistantRequest, CompletionAssistantResponse, DatabaseInfo,
-    ExtensionInfo, ForeignKeyInfo, FunctionInfo, IndexInfo, ObjectInfo, ObjectStatistics, OwnerInfo, QueryResult,
-    RuleInfo, SchemaInfo, SequenceInfo, TableInfo, TriggerInfo,
+    DatabaseStorageInfo, ExtensionInfo, ForeignKeyInfo, FunctionInfo, IndexInfo, ObjectInfo, ObjectStatistics,
+    OwnerInfo, QueryResult, RuleInfo, SchemaInfo, SequenceInfo, TableInfo, TriggerInfo,
 };
 
 fn pg_temporal_to_json_value(row: &Row, idx: usize) -> Option<serde_json::Value> {
@@ -1607,19 +1607,51 @@ fn validate_postgres_ssl_paths(url: &str) -> Result<(), String> {
     postgres_connection_url(url).map(|_| ())
 }
 
+fn list_databases_sql() -> &'static str {
+    "SELECT datname FROM pg_database \
+     WHERE datallowconn = true \
+     ORDER BY datname"
+}
+
+fn database_storage_sql() -> &'static str {
+    "SELECT d.datname, \
+            CASE \
+              WHEN has_database_privilege(d.datname, 'CONNECT') \
+                OR COALESCE(( \
+                  SELECT pg_has_role(current_user, r.oid, 'MEMBER') \
+                  FROM pg_roles r \
+                  WHERE r.rolname = 'pg_read_all_stats' \
+                ), false) \
+              THEN pg_database_size(d.oid) \
+              ELSE NULL \
+            END AS size_bytes \
+     FROM pg_database d \
+     WHERE d.datallowconn = true \
+       AND d.datname = ANY($1::text[]) \
+     ORDER BY d.datname"
+}
+
 pub async fn list_databases(pool: &Pool) -> Result<Vec<DatabaseInfo>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(
-        &client,
-        "SELECT datname FROM pg_database \
-         WHERE datallowconn = true \
-         ORDER BY datname",
-        &[],
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    let rows = postgres_query_cached(&client, list_databases_sql(), &[]).await.map_err(|e| e.to_string())?;
 
     Ok(rows.iter().map(|row| DatabaseInfo { name: pg_row_try_string(row, 0) }).collect())
+}
+
+pub async fn list_database_storage(pool: &Pool, database_names: &[String]) -> Result<Vec<DatabaseStorageInfo>, String> {
+    if database_names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
+    let rows =
+        postgres_query_cached(&client, database_storage_sql(), &[&database_names]).await.map_err(|e| e.to_string())?;
+    Ok(rows
+        .iter()
+        .map(|row| DatabaseStorageInfo {
+            name: pg_row_try_string(row, 0),
+            size_bytes: row.try_get::<_, Option<i64>>(1).ok().flatten(),
+        })
+        .collect())
 }
 
 pub async fn list_tables(pool: &Pool, schema: &str) -> Result<Vec<TableInfo>, String> {
@@ -2628,6 +2660,7 @@ pub async fn execute_query_with_max_rows_and_cancel(
 pub async fn stream_select_query_with_cancel(
     pool: &Pool,
     schema: Option<&str>,
+    setup_sql: &[String],
     sql: &str,
     max_rows: Option<usize>,
     cancel_token: Option<CancellationToken>,
@@ -2654,28 +2687,72 @@ pub async fn stream_select_query_with_cancel(
         .await?;
     }
 
-    let pg_cancel_token = client.cancel_token();
+    let setup_transaction_started = !setup_sql.is_empty();
+    if setup_transaction_started {
+        execute_postgres_infra_statement(&client, "BEGIN", budget.recycle_timeout, "export_setup.begin").await?;
+    }
+
     let query_timeout = budget.query_timeout;
     let timeout_error =
         format!("Query timed out after {} seconds", query_timeout.map_or(0, |timeout| timeout.as_secs()));
-    let progress_clock = Arc::new(StreamProgressClock::new());
-    let progress_clock_for_stream = progress_clock.clone();
-    let mut on_stream_item = |item| {
-        on_item(item)?;
-        progress_clock_for_stream.mark();
+    let setup_result = async {
+        for setup_statement in setup_sql {
+            wait_postgres_query(
+                client.cancel_token(),
+                cancel_context.clone(),
+                cancel_token.clone(),
+                query_timeout,
+                budget.cancel_timeout,
+                async {
+                    client.batch_execute(setup_statement).await.map_err(pg_error_to_string)?;
+                    Ok(())
+                },
+            )
+            .await?;
+        }
         Ok(())
-    };
-    let result = await_stream_with_progress_timeout(
-        stream_select_query_inner(&client, sql, row_limit, &mut on_stream_item),
-        query_timeout,
-        progress_clock,
-        cancel_token.as_ref(),
-        timeout_error.clone(),
-    )
-    .await;
-    if result.as_ref().is_err_and(|error| error == &timeout_error || error == crate::query::QUERY_CANCELED) {
-        cancel_postgres_query(pg_cancel_token, cancel_context.as_ref(), budget.cancel_timeout).await;
     }
+    .await;
+
+    let result = match setup_result {
+        Ok(()) => {
+            let pg_cancel_token = client.cancel_token();
+            let progress_clock = Arc::new(StreamProgressClock::new());
+            let progress_clock_for_stream = progress_clock.clone();
+            let mut on_stream_item = |item| {
+                on_item(item)?;
+                progress_clock_for_stream.mark();
+                Ok(())
+            };
+            let result = await_stream_with_progress_timeout(
+                stream_select_query_inner(&client, sql, row_limit, &mut on_stream_item),
+                query_timeout,
+                progress_clock,
+                cancel_token.as_ref(),
+                timeout_error.clone(),
+            )
+            .await;
+            if result.as_ref().is_err_and(|error| error == &timeout_error || error == crate::query::QUERY_CANCELED) {
+                cancel_postgres_query(pg_cancel_token, cancel_context.as_ref(), budget.cancel_timeout).await;
+            }
+            result
+        }
+        Err(error) => Err(error),
+    };
+
+    let result = if setup_transaction_started {
+        let rollback_result =
+            execute_postgres_infra_statement(&client, "ROLLBACK", budget.cleanup_timeout, "export_setup.rollback")
+                .await;
+        match (result, rollback_result) {
+            (Ok(rows), Ok(_)) => Ok(rows),
+            (Err(query_err), Ok(_)) => Err(query_err),
+            (Ok(_), Err(rollback_err)) => Err(rollback_err),
+            (Err(query_err), Err(rollback_err)) => Err(format!("{query_err}; {rollback_err}")),
+        }
+    } else {
+        result
+    };
 
     if schema_was_set {
         let reset_result = reset_postgres_search_path(&client, budget.cleanup_timeout, start).await;
@@ -3634,6 +3711,19 @@ mod tests {
         let types = vec!["payload_type".to_string()];
         assert!(matching_pg_text_column_types(&columns, Some(types)).is_empty());
         assert!(matching_pg_text_column_types(&columns, None).is_empty());
+    fn database_list_does_not_collect_storage_usage() {
+        assert!(list_databases_sql().contains("pg_database"));
+        assert!(!list_databases_sql().contains("pg_database_size"));
+    }
+
+    #[test]
+    fn database_storage_is_scoped_and_permission_guarded() {
+        let sql = database_storage_sql();
+        assert!(sql.contains("d.datname = ANY($1::text[])"));
+        assert!(sql.contains("has_database_privilege"));
+        assert!(sql.contains("pg_read_all_stats"));
+        assert!(sql.contains("pg_database_size"));
+        assert!(sql.contains("ELSE NULL"));
     }
 
     #[test]
