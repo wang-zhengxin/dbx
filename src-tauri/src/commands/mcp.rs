@@ -261,7 +261,7 @@ fn resolve_managed_mcp_command(
 fn require_managed_mcp_command(command: Option<(String, Vec<String>)>) -> Result<(String, Vec<String>), String> {
     command.ok_or_else(|| {
         format!(
-            "DBX MCP Server is unavailable: no compatible Node.js ({}) installation containing {} was found. Install MCP Server from DBX settings and try again.",
+            "[dbxMcpMissing] No compatible Node.js ({}) installation containing {} was found.",
             MCP_MIN_NODE_VERSION_REQUIREMENT, MCP_PACKAGE_NAME
         )
     })
@@ -906,12 +906,13 @@ mod tests {
     #[cfg(windows)]
     use super::first_windows_command_path;
     #[cfg(not(windows))]
-    use super::{bash_login_script, canonical_runtime_path, NodeRuntimeCandidate};
+    use super::{bash_login_script, NodeRuntimeCandidate};
     use super::{
-        is_mcp_compatible_node_version, mcp_command_for_runtime, mcp_native_binary_path_for, mcp_package,
-        normalized_reported_path, npm_cli_candidates, parse_minimum_node_version, parse_node_version, prefer_runtime,
-        prefixed_output_path, require_managed_mcp_command, resolve_managed_mcp_command, stdout_after_shell_marker,
-        NodeRuntime, NodeVersion, MCP_MIN_NODE_VERSION_REQUIREMENT, MCP_PACKAGE_NAME, SHELL_COMMAND_MARKER,
+        canonical_runtime_path, is_mcp_compatible_node_version, mcp_command_for_runtime, mcp_native_binary_path_for,
+        mcp_package, normalized_reported_path, npm_cli_candidates, parse_minimum_node_version, parse_node_version,
+        prefer_runtime, prefixed_output_path, require_managed_mcp_command, resolve_managed_mcp_command,
+        stdout_after_shell_marker, NodeRuntime, NodeVersion, MCP_MIN_NODE_VERSION_REQUIREMENT, MCP_PACKAGE_NAME,
+        SHELL_COMMAND_MARKER,
     };
     #[cfg(not(windows))]
     use super::{shell_command_script, shell_quote};
@@ -1137,7 +1138,7 @@ mod tests {
 
         assert!(error.contains(MCP_MIN_NODE_VERSION_REQUIREMENT));
         assert!(error.contains(MCP_PACKAGE_NAME));
-        assert!(error.contains("DBX settings"));
+        assert!(error.starts_with("[dbxMcpMissing]"));
     }
 
     #[test]

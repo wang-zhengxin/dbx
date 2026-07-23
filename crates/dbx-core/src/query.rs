@@ -2674,7 +2674,7 @@ async fn exec_tx_pg_inner(
     if let Some(s) = schema {
         db::postgres::execute_postgres_infra_statement(
             &client,
-            &format!("SET search_path TO {}", db::postgres::pg_quote_ident(s)),
+            &db::postgres::postgres_set_search_path_sql(s, db::postgres::PostgresSearchPathContext::Transaction),
             budget.recycle_timeout,
             "schema.set",
         )
@@ -3066,9 +3066,15 @@ async fn begin_transaction_session(
             let begin_sql = postgres_transaction_begin_sql(consistent_snapshot);
             conn.execute(begin_sql, &[]).await.map_err(|e| format!("BEGIN failed: {e}"))?;
             if let Some(schema) = schema {
-                conn.execute(&format!("SET LOCAL search_path TO {}", db::postgres::pg_quote_ident(schema)), &[])
-                    .await
-                    .map_err(|e| format!("SET search_path failed: {e}"))?;
+                conn.execute(
+                    &db::postgres::postgres_set_search_path_sql(
+                        schema,
+                        db::postgres::PostgresSearchPathContext::LocalTransaction,
+                    ),
+                    &[],
+                )
+                .await
+                .map_err(|e| format!("SET search_path failed: {e}"))?;
             }
             TxnConnection::Postgres(Box::new(conn))
         }

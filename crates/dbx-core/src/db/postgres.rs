@@ -2647,6 +2647,25 @@ pub(crate) fn pg_quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PostgresSearchPathContext {
+    Query,
+    Transaction,
+    LocalTransaction,
+}
+
+pub(crate) fn postgres_set_search_path_sql(schema: &str, context: PostgresSearchPathContext) -> String {
+    let (scope, suffix) = match context {
+        // Ordinary queries and exports historically fall back to public for
+        // extensions and helper functions after checking the selected schema.
+        PostgresSearchPathContext::Query => ("", ", pg_catalog, public"),
+        PostgresSearchPathContext::Transaction => ("", ", pg_catalog"),
+        PostgresSearchPathContext::LocalTransaction => (" LOCAL", ", pg_catalog"),
+    };
+    // PostgreSQL otherwise searches pg_catalog before every explicit path item.
+    format!("SET{scope} search_path TO {}{suffix}", pg_quote_ident(schema))
+}
+
 fn query_result_row_limit(max_rows: Option<usize>) -> usize {
     max_rows.unwrap_or(crate::query::MAX_ROWS).max(1)
 }
@@ -2729,7 +2748,7 @@ pub async fn stream_select_query_with_cancel(
         // in the active schema, so the streaming path must use the same search_path.
         execute_postgres_infra_statement(
             &client,
-            &format!("SET search_path TO {}, public", pg_quote_ident(schema)),
+            &postgres_set_search_path_sql(schema, PostgresSearchPathContext::Query),
             budget.recycle_timeout,
             "schema.set",
         )
@@ -2846,7 +2865,7 @@ pub async fn execute_query_with_schema_and_max_rows(
     let set_schema_start = Instant::now();
     execute_postgres_infra_statement(
         &client,
-        &format!("SET search_path TO {}, public", pg_quote_ident(schema)),
+        &postgres_set_search_path_sql(schema, PostgresSearchPathContext::Query),
         super::connection_timeout(),
         "schema.set",
     )
@@ -2911,7 +2930,7 @@ pub async fn execute_query_with_schema_and_max_rows_and_cancel(
     let set_schema_start = Instant::now();
     execute_postgres_infra_statement(
         &client,
-        &format!("SET search_path TO {}, public", pg_quote_ident(schema)),
+        &postgres_set_search_path_sql(schema, PostgresSearchPathContext::Query),
         budget.recycle_timeout,
         "schema.set",
     )
@@ -3762,6 +3781,34 @@ mod tests {
         let types = vec!["payload_type".to_string()];
         assert!(matching_pg_text_column_types(&columns, Some(types)).is_empty());
         assert!(matching_pg_text_column_types(&columns, None).is_empty());
+    }
+
+    #[test]
+    fn postgres_query_search_path_preserves_public_after_catalog() {
+        assert_eq!(
+            postgres_set_search_path_sql("application", PostgresSearchPathContext::Query),
+            "SET search_path TO \"application\", pg_catalog, public"
+        );
+    }
+
+    #[test]
+    fn postgres_transaction_search_paths_prioritize_selected_schema() {
+        assert_eq!(
+            postgres_set_search_path_sql("application", PostgresSearchPathContext::Transaction),
+            "SET search_path TO \"application\", pg_catalog"
+        );
+        assert_eq!(
+            postgres_set_search_path_sql("application", PostgresSearchPathContext::LocalTransaction),
+            "SET LOCAL search_path TO \"application\", pg_catalog"
+        );
+    }
+
+    #[test]
+    fn postgres_search_path_safely_quotes_selected_schema() {
+        assert_eq!(
+            postgres_set_search_path_sql("tenant\"; RESET search_path; --", PostgresSearchPathContext::Query,),
+            "SET search_path TO \"tenant\"\"; RESET search_path; --\", pg_catalog, public"
+        );
     }
 
     #[test]
@@ -4783,6 +4830,122 @@ mod tests {
         assert_eq!(child_key, None);
         assert!(parent_ddl.contains(") PARTITION BY RANGE (id);"), "ddl: {parent_ddl}");
         assert!(!parent_ddl.contains("PARTITION OF"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_TEST_POSTGRES_URL pointing at a writable PostgreSQL database"]
+    async fn postgres_schema_context_prioritizes_selected_schema_and_cleans_up() {
+        let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("DBX_TEST_POSTGRES_URL");
+        let pool = connect(&url, Duration::from_secs(5)).await.expect("connect postgres");
+        let suffix = format!("{}_{}", std::process::id(), uuid::Uuid::new_v4().simple());
+        let schema = format!("dbx_issue_830_\"{suffix}");
+        let schema_ident = pg_quote_ident(&schema);
+        let helper = format!("dbx_issue_830_public_{suffix}");
+        let helper_ident = pg_quote_ident(&helper);
+        let initial_path = execute_query(&pool, "SHOW search_path").await.expect("read initial search_path");
+        let initial_path_value = initial_path.rows[0][0].as_str().expect("search_path string").to_string();
+        let client = pool.get().await.expect("get setup client");
+        client
+            .batch_execute(&format!(
+                "CREATE SCHEMA {schema_ident}; \
+                 CREATE TABLE {schema_ident}.pg_settings(marker text); \
+                 INSERT INTO {schema_ident}.pg_settings VALUES ('selected-schema'); \
+                 CREATE FUNCTION public.{helper_ident}() RETURNS text \
+                 LANGUAGE SQL IMMUTABLE AS $$ SELECT 'public-fallback'::text $$"
+            ))
+            .await
+            .expect("create search_path fixtures");
+        drop(client);
+
+        let query_sql = format!("SELECT marker, {helper_ident}() AS helper FROM pg_settings");
+        let ordinary_result = execute_query_with_schema(&pool, &schema, &query_sql).await;
+        let path_after_ordinary = execute_query(&pool, "SHOW search_path").await;
+
+        let mut streamed_rows = Vec::new();
+        let streaming_result = stream_select_query_with_cancel(
+            &pool,
+            Some(&schema),
+            &[],
+            &query_sql,
+            None,
+            None,
+            DbOperationBudget::with_defaults(),
+            None,
+            |item| {
+                if let PostgresQueryStreamItem::Row(row) = item {
+                    streamed_rows.push(row);
+                }
+                Ok(())
+            },
+        )
+        .await;
+        let path_after_streaming = execute_query(&pool, "SHOW search_path").await;
+
+        let transaction_cleanup = async {
+            let client = pool.get().await.map_err(|error| error.to_string())?;
+            client
+                .execute(&postgres_set_search_path_sql(&schema, PostgresSearchPathContext::Transaction), &[])
+                .await
+                .map_err(pg_error_to_string)?;
+            let selected: String = client
+                .query_one("SELECT marker FROM pg_settings", &[])
+                .await
+                .map_err(pg_error_to_string)?
+                .try_get(0)
+                .map_err(pg_error_to_string)?;
+            client.execute("RESET search_path", &[]).await.map_err(pg_error_to_string)?;
+            let after_reset: String = client
+                .query_one("SHOW search_path", &[])
+                .await
+                .map_err(pg_error_to_string)?
+                .try_get(0)
+                .map_err(pg_error_to_string)?;
+
+            client.execute("BEGIN", &[]).await.map_err(pg_error_to_string)?;
+            client
+                .execute(&postgres_set_search_path_sql(&schema, PostgresSearchPathContext::LocalTransaction), &[])
+                .await
+                .map_err(pg_error_to_string)?;
+            let local_selected: String = client
+                .query_one("SELECT marker FROM pg_settings", &[])
+                .await
+                .map_err(pg_error_to_string)?
+                .try_get(0)
+                .map_err(pg_error_to_string)?;
+            client.execute("COMMIT", &[]).await.map_err(pg_error_to_string)?;
+            let after_commit: String = client
+                .query_one("SHOW search_path", &[])
+                .await
+                .map_err(pg_error_to_string)?
+                .try_get(0)
+                .map_err(pg_error_to_string)?;
+            Ok::<_, String>((selected, after_reset, local_selected, after_commit))
+        }
+        .await;
+
+        let cleanup_client = pool.get().await.expect("get cleanup client");
+        cleanup_client
+            .batch_execute(&format!("DROP FUNCTION public.{helper_ident}(); DROP SCHEMA {schema_ident} CASCADE"))
+            .await
+            .expect("clean search_path fixtures");
+
+        let ordinary = ordinary_result.expect("ordinary schema query");
+        assert_eq!(
+            ordinary.rows,
+            vec![vec![serde_json::json!("selected-schema"), serde_json::json!("public-fallback")]]
+        );
+        assert_eq!(path_after_ordinary.expect("path after ordinary query").rows, initial_path.rows);
+        assert_eq!(streaming_result.expect("streaming schema query"), 1);
+        assert_eq!(
+            streamed_rows,
+            vec![vec![serde_json::json!("selected-schema"), serde_json::json!("public-fallback")]]
+        );
+        assert_eq!(path_after_streaming.expect("path after streaming query").rows, initial_path.rows);
+        let (selected, after_reset, local_selected, after_commit) = transaction_cleanup.expect("transaction cleanup");
+        assert_eq!(selected, "selected-schema");
+        assert_eq!(local_selected, "selected-schema");
+        assert_eq!(after_reset, initial_path_value);
+        assert_eq!(after_commit, initial_path_value);
     }
 
     #[test]

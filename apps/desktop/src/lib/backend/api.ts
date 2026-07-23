@@ -255,6 +255,8 @@ export const loadDesktopSettings = forward("loadDesktopSettings");
 export const saveDesktopSettings = forward("saveDesktopSettings");
 export const loadMcpGlobalPolicy = forward("loadMcpGlobalPolicy");
 export const saveMcpGlobalPolicy = forward("saveMcpGlobalPolicy");
+export const loadMaxAgentTurns = forward("loadMaxAgentTurns");
+export const saveMaxAgentTurns = forward("saveMaxAgentTurns");
 export const completeAppClose = forward("completeAppClose");
 export const requestAppClose = forward("requestAppClose");
 export const setDriverStoreDir = forward("setDriverStoreDir");
@@ -489,6 +491,7 @@ export const mongoDropDatabase = forward("mongoDropDatabase");
 export const mongoDropCollection = forward("mongoDropCollection");
 export const mongoRenameCollection = forward("mongoRenameCollection");
 export const documentFindDocuments = forward("documentFindDocuments");
+export const elasticsearchCountDocuments = forward("elasticsearchCountDocuments");
 export const mongoFindDocuments = forward("mongoFindDocuments");
 export const mongoParseShellCommand = forward("mongoParseShellCommand");
 export const mongoFindOne = forward("mongoFindOne");
@@ -609,6 +612,7 @@ export type {
   KvPutOptions,
   KvPutResponse,
   KvDeleteResponse,
+  DocumentQueryResult,
   MongoDocumentResult,
   HistoryEntry,
   HistoryConnectionFilter,
