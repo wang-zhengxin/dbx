@@ -16,7 +16,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_postgres::config::SslMode;
-use tokio_postgres::types::{FromSql, Type};
+use tokio_postgres::types::{FromSql, Kind, Type};
 use tokio_postgres::{NoTls, Row, SimpleQueryMessage};
 use tokio_util::sync::CancellationToken;
 
@@ -340,8 +340,16 @@ pub(crate) enum PgColType {
 
 const POSTGRES_FIRST_NORMAL_OBJECT_ID: u32 = 16_384;
 
-fn pg_type_requires_text_protocol(oid: u32, col_type: PgColType) -> bool {
-    oid >= POSTGRES_FIRST_NORMAL_OBJECT_ID && matches!(col_type, PgColType::Other)
+fn pg_scalar_type_requires_text_protocol(oid: u32, col_type: PgColType) -> bool {
+    oid >= POSTGRES_FIRST_NORMAL_OBJECT_ID && !matches!(col_type, PgColType::Vector | PgColType::Geometry)
+}
+
+fn pg_type_requires_text_protocol(pg_type: &Type, col_type: PgColType) -> bool {
+    match pg_type.kind() {
+        Kind::Array(element_type) => element_type.oid() >= POSTGRES_FIRST_NORMAL_OBJECT_ID,
+        Kind::Simple => pg_scalar_type_requires_text_protocol(pg_type.oid(), col_type),
+        _ => pg_type.oid() >= POSTGRES_FIRST_NORMAL_OBJECT_ID,
+    }
 }
 
 pub(crate) fn classify_pg_type(type_name: &str) -> PgColType {
@@ -698,17 +706,35 @@ enum PreparedSelectOutcome {
     TextFallback { column_types: Vec<String>, unsupported_type: String },
 }
 
-fn prepared_select_metadata(
-    stmt: &tokio_postgres::Statement,
-) -> (Vec<String>, Vec<String>, Vec<PgColType>, Option<String>) {
+struct PreparedSelectMetadata {
+    columns: Vec<String>,
+    column_types: Vec<String>,
+    column_classes: Vec<PgColType>,
+    unsupported_type: Option<String>,
+}
+
+fn prepared_select_metadata(stmt: &tokio_postgres::Statement) -> PreparedSelectMetadata {
     let columns: Vec<String> = stmt.columns().iter().map(|c| c.name().to_string()).collect();
     let column_types: Vec<String> = stmt.columns().iter().map(|c| c.type_().name().to_string()).collect();
     let column_classes = classify_pg_column_types(&column_types);
     let unsupported_type = stmt.columns().iter().zip(&column_classes).find_map(|(column, col_type)| {
         let pg_type = column.type_();
-        pg_type_requires_text_protocol(pg_type.oid(), *col_type).then(|| pg_type.name().to_string())
+        pg_type_requires_text_protocol(pg_type, *col_type).then(|| pg_type.name().to_string())
     });
-    (columns, column_types, column_classes, unsupported_type)
+    PreparedSelectMetadata { columns, column_types, column_classes, unsupported_type }
+}
+
+async fn prepare_select_with_metadata(
+    client: &deadpool_postgres::Client,
+    sql: &str,
+) -> Result<(tokio_postgres::Statement, PreparedSelectMetadata), tokio_postgres::Error> {
+    let mut stmt = client.prepare_cached(sql).await?;
+    let mut metadata = prepared_select_metadata(&stmt);
+    if metadata.unsupported_type.is_some() {
+        stmt = client.prepare(sql).await?;
+        metadata = prepared_select_metadata(&stmt);
+    }
+    Ok((stmt, metadata))
 }
 
 async fn execute_select_prepared(
@@ -718,23 +744,15 @@ async fn execute_select_prepared(
     row_limit: usize,
 ) -> Result<PreparedSelectOutcome, tokio_postgres::Error> {
     let prepared_start = Instant::now();
-    let mut stmt = client.prepare_cached(sql).await?;
+    let (stmt, metadata) = prepare_select_with_metadata(client, sql).await?;
     log::info!(
         "[postgres][select:prepare_cached:done] elapsed_ms={} total_ms={}",
         prepared_start.elapsed().as_millis(),
         start.elapsed().as_millis()
     );
-    let (mut columns, mut column_types, mut column_classes, cached_unsupported_type) = prepared_select_metadata(&stmt);
-    if cached_unsupported_type.is_some() {
-        stmt = client.prepare(sql).await?;
-        let (fresh_columns, fresh_column_types, fresh_column_classes, fresh_unsupported_type) =
-            prepared_select_metadata(&stmt);
-        columns = fresh_columns;
-        column_types = fresh_column_types;
-        column_classes = fresh_column_classes;
-        if let Some(unsupported_type) = fresh_unsupported_type {
-            return Ok(PreparedSelectOutcome::TextFallback { column_types, unsupported_type });
-        }
+    let PreparedSelectMetadata { columns, column_types, column_classes, unsupported_type } = metadata;
+    if let Some(unsupported_type) = unsupported_type {
+        return Ok(PreparedSelectOutcome::TextFallback { column_types, unsupported_type });
     }
 
     let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
@@ -867,7 +885,7 @@ async fn finish_prepared_select(
     }
 }
 
-async fn execute_select_query(
+pub(crate) async fn execute_select_query(
     client: &deadpool_postgres::Client,
     sql: &str,
     start: Instant,
@@ -903,6 +921,7 @@ pub enum PostgresQueryStreamItem {
 
 enum PostgresQueryStreamError {
     Postgres { err: tokio_postgres::Error, emitted: bool },
+    TextFallback { column_types: Vec<String>, unsupported_type: String },
     Export(String),
 }
 
@@ -910,6 +929,9 @@ impl PostgresQueryStreamError {
     fn into_string(self) -> String {
         match self {
             Self::Postgres { err, .. } => pg_error_to_string(err),
+            Self::TextFallback { unsupported_type, .. } => {
+                format!("PostgreSQL type {unsupported_type} requires text protocol")
+            }
             Self::Export(err) => err,
         }
     }
@@ -921,11 +943,13 @@ async fn stream_select_query_prepared(
     row_limit: Option<usize>,
     on_item: &mut impl FnMut(PostgresQueryStreamItem) -> Result<(), String>,
 ) -> Result<u64, PostgresQueryStreamError> {
-    let stmt =
-        client.prepare_cached(sql).await.map_err(|err| PostgresQueryStreamError::Postgres { err, emitted: false })?;
-    let columns: Vec<String> = stmt.columns().iter().map(|c| c.name().to_string()).collect();
-    let column_types: Vec<String> = stmt.columns().iter().map(|c| c.type_().name().to_string()).collect();
-    let column_classes = classify_pg_column_types(&column_types);
+    let (stmt, metadata) = prepare_select_with_metadata(client, sql)
+        .await
+        .map_err(|err| PostgresQueryStreamError::Postgres { err, emitted: false })?;
+    let PreparedSelectMetadata { columns, column_types, column_classes, unsupported_type } = metadata;
+    if let Some(unsupported_type) = unsupported_type {
+        return Err(PostgresQueryStreamError::TextFallback { column_types, unsupported_type });
+    }
 
     let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
     let stream = client
@@ -963,6 +987,7 @@ async fn stream_select_query_text(
     client: &deadpool_postgres::Client,
     sql: &str,
     row_limit: Option<usize>,
+    prepared_column_types: Option<Vec<String>>,
     on_item: &mut impl FnMut(PostgresQueryStreamItem) -> Result<(), String>,
 ) -> Result<u64, String> {
     let stream = client.simple_query_raw(sql).await.map_err(pg_error_to_string)?;
@@ -973,7 +998,8 @@ async fn stream_select_query_text(
         match message.map_err(pg_error_to_string)? {
             SimpleQueryMessage::RowDescription(cols) => {
                 columns = cols.iter().map(|c| c.name().to_string()).collect();
-                on_item(PostgresQueryStreamItem::Columns { columns: columns.clone(), column_types: Vec::new() })?;
+                let column_types = matching_pg_text_column_types(&columns, prepared_column_types.clone());
+                on_item(PostgresQueryStreamItem::Columns { columns: columns.clone(), column_types })?;
             }
             SimpleQueryMessage::Row(row) => {
                 if row_limit.is_some_and(|limit| rows_streamed as usize >= limit) {
@@ -981,7 +1007,8 @@ async fn stream_select_query_text(
                 }
                 if columns.is_empty() {
                     columns = row.columns().iter().map(|c| c.name().to_string()).collect();
-                    on_item(PostgresQueryStreamItem::Columns { columns: columns.clone(), column_types: Vec::new() })?;
+                    let column_types = matching_pg_text_column_types(&columns, prepared_column_types.clone());
+                    on_item(PostgresQueryStreamItem::Columns { columns: columns.clone(), column_types })?;
                 }
                 let mut values = Vec::with_capacity(row.len());
                 for i in 0..row.len() {
@@ -1000,7 +1027,7 @@ async fn stream_select_query_text(
     Ok(rows_streamed)
 }
 
-async fn stream_select_query_inner(
+pub(crate) async fn stream_select_query_inner(
     client: &deadpool_postgres::Client,
     sql: &str,
     row_limit: Option<usize>,
@@ -1008,6 +1035,13 @@ async fn stream_select_query_inner(
 ) -> Result<u64, String> {
     match stream_select_query_prepared(client, sql, row_limit, on_item).await {
         Ok(rows) => Ok(rows),
+        Err(PostgresQueryStreamError::TextFallback { column_types, unsupported_type }) => {
+            log::info!(
+                "[postgres][stream:text_fallback] unsupported_type={} switching_to=simple_query",
+                unsupported_type
+            );
+            stream_select_query_text(client, sql, row_limit, Some(column_types), on_item).await
+        }
         Err(PostgresQueryStreamError::Postgres { err, emitted: false }) if should_retry_postgres_stale_cache(&err) => {
             // The cached prepared statement can become stale after schema changes.
             // Evict and retry once, matching the normal query execution path.
@@ -1018,13 +1052,20 @@ async fn stream_select_query_inner(
                 Err(PostgresQueryStreamError::Postgres { err, emitted: false })
                     if should_retry_postgres_text_query(&err) =>
                 {
-                    stream_select_query_text(client, sql, row_limit, on_item).await
+                    stream_select_query_text(client, sql, row_limit, None, on_item).await
+                }
+                Err(PostgresQueryStreamError::TextFallback { column_types, unsupported_type }) => {
+                    log::info!(
+                        "[postgres][stream:text_fallback] unsupported_type={} switching_to=simple_query",
+                        unsupported_type
+                    );
+                    stream_select_query_text(client, sql, row_limit, Some(column_types), on_item).await
                 }
                 Err(err) => Err(err.into_string()),
             }
         }
         Err(PostgresQueryStreamError::Postgres { err, emitted: false }) if should_retry_postgres_text_query(&err) => {
-            stream_select_query_text(client, sql, row_limit, on_item).await
+            stream_select_query_text(client, sql, row_limit, None, on_item).await
         }
         Err(err) => Err(err.into_string()),
     }
@@ -1054,9 +1095,15 @@ async fn stream_query_rows_on_client(
     cancelled: &AtomicBool,
     on_row: &mut impl FnMut(&[serde_json::Value]) -> Result<(), String>,
 ) -> Result<u64, String> {
-    let stmt = client.prepare_cached(sql).await.map_err(pg_error_to_string)?;
-    let column_types: Vec<String> = stmt.columns().iter().map(|c| c.type_().name().to_string()).collect();
-    let column_classes = classify_pg_column_types(&column_types);
+    let (stmt, metadata) = prepare_select_with_metadata(client, sql).await.map_err(pg_error_to_string)?;
+    let PreparedSelectMetadata { column_classes, unsupported_type, .. } = metadata;
+    if let Some(unsupported_type) = unsupported_type {
+        log::info!(
+            "[postgres][row_stream:text_fallback] unsupported_type={} switching_to=simple_query",
+            unsupported_type
+        );
+        return stream_query_rows_text_on_client(client, sql, max_rows, cancelled, on_row).await;
+    }
     let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
     let stream = client.query_raw(&stmt, params).await.map_err(pg_error_to_string)?;
     tokio::pin!(stream);
@@ -1088,17 +1135,19 @@ async fn stream_query_rows_text_on_client(
     cancelled: &AtomicBool,
     on_row: &mut impl FnMut(&[serde_json::Value]) -> Result<(), String>,
 ) -> Result<u64, String> {
-    let messages = client.simple_query(sql).await.map_err(pg_error_to_string)?;
+    let stream = client.simple_query_raw(sql).await.map_err(pg_error_to_string)?;
+    tokio::pin!(stream);
     let row_limit = max_rows.unwrap_or(usize::MAX);
     let mut rows_exported = 0_u64;
 
-    for message in messages {
+    while let Some(message) = stream.next().await {
         if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(crate::query::canceled_error());
         }
         if rows_exported as usize >= row_limit {
             break;
         }
+        let message = message.map_err(pg_error_to_string)?;
         if let SimpleQueryMessage::Row(row) = message {
             let mut values = Vec::with_capacity(row.len());
             for i in 0..row.len() {
@@ -3678,24 +3727,26 @@ mod tests {
 
     #[test]
     fn postgres_custom_other_type_requires_text_protocol() {
-        assert!(pg_type_requires_text_protocol(POSTGRES_FIRST_NORMAL_OBJECT_ID, PgColType::Other));
-        assert!(pg_type_requires_text_protocol(98_765, PgColType::Other));
+        assert!(pg_scalar_type_requires_text_protocol(POSTGRES_FIRST_NORMAL_OBJECT_ID, PgColType::Other));
+        assert!(pg_scalar_type_requires_text_protocol(98_765, PgColType::Other));
+        assert!(pg_scalar_type_requires_text_protocol(98_765, PgColType::GenericArray));
     }
 
     #[test]
     fn postgres_builtin_or_supported_type_keeps_binary_protocol() {
-        assert!(!pg_type_requires_text_protocol(POSTGRES_FIRST_NORMAL_OBJECT_ID - 1, PgColType::Other));
-        assert!(!pg_type_requires_text_protocol(Type::INT4.oid(), PgColType::Other));
-        assert!(!pg_type_requires_text_protocol(Type::VARCHAR.oid(), PgColType::Other));
-        assert!(!pg_type_requires_text_protocol(98_765, PgColType::Vector));
-        assert!(!pg_type_requires_text_protocol(98_765, PgColType::Geometry));
+        assert!(!pg_scalar_type_requires_text_protocol(POSTGRES_FIRST_NORMAL_OBJECT_ID - 1, PgColType::Other));
+        assert!(!pg_type_requires_text_protocol(&Type::INT4, PgColType::Other));
+        assert!(!pg_type_requires_text_protocol(&Type::VARCHAR, PgColType::Other));
+        assert!(!pg_type_requires_text_protocol(&Type::INT4_ARRAY, PgColType::GenericArray));
+        assert!(!pg_scalar_type_requires_text_protocol(98_765, PgColType::Vector));
+        assert!(!pg_scalar_type_requires_text_protocol(98_765, PgColType::Geometry));
     }
 
     #[test]
     fn postgres_query_uses_text_when_any_output_type_is_unsupported() {
         let columns =
             [(Type::INT4.oid(), PgColType::Other), (98_765, PgColType::Other), (Type::TEXT.oid(), PgColType::Other)];
-        assert!(columns.into_iter().any(|(oid, col_type)| pg_type_requires_text_protocol(oid, col_type)));
+        assert!(columns.into_iter().any(|(oid, col_type)| pg_scalar_type_requires_text_protocol(oid, col_type)));
     }
 
     #[test]
@@ -3887,6 +3938,91 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires DBX_TEST_POSTGRES_URL pointing at a writable PostgreSQL 18 database"]
+    async fn postgres_custom_type_arrays_and_exports_use_server_text_output() {
+        let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("DBX_TEST_POSTGRES_URL");
+        let pool = connect(&url, Duration::from_secs(5)).await.expect("connect postgres");
+        assert_postgres_18(&pool).await;
+        let schema = format!("dbx_custom_array_{}", uuid::Uuid::new_v4().simple());
+        let schema_ident = pg_quote_ident(&schema);
+        let payload_type = format!("{schema_ident}.payload");
+        let mood_type = format!("{schema_ident}.mood");
+        let score_type = format!("{schema_ident}.positive_int");
+        let underscore_scalar_type = format!("{schema_ident}._hidden");
+        let vector_named_enum_type = format!("{schema_ident}.vector");
+        let table = format!("{schema_ident}.custom_arrays");
+        let select_sql = format!("SELECT payloads, moods, scores FROM {table}");
+        execute_query(&pool, &format!("CREATE SCHEMA {schema_ident}")).await.expect("create schema");
+
+        let exercise = async {
+            execute_query(&pool, &format!("CREATE TYPE {payload_type} AS (id integer, label text)")).await?;
+            execute_query(&pool, &format!("CREATE TYPE {mood_type} AS ENUM ('ready', 'done')")).await?;
+            execute_query(&pool, &format!("CREATE DOMAIN {score_type} AS integer CHECK (VALUE > 0)")).await?;
+            execute_query(&pool, &format!("CREATE TYPE {underscore_scalar_type} AS ENUM ('secret')")).await?;
+            execute_query(&pool, &format!("CREATE TYPE {vector_named_enum_type} AS ENUM ('label')")).await?;
+            execute_query(
+                &pool,
+                &format!(
+                    "CREATE TABLE {table} (payloads {payload_type}[], moods {mood_type}[], scores {score_type}[])"
+                ),
+            )
+            .await?;
+            execute_query(
+                &pool,
+                &format!(
+                    "INSERT INTO {table} VALUES \
+                     (ARRAY[ROW(7, 'alpha')::{payload_type}], ARRAY['ready'::{mood_type}], ARRAY[7::{score_type}])"
+                ),
+            )
+            .await?;
+
+            let query = execute_query(&pool, &select_sql).await?;
+            let underscore_scalar =
+                execute_query(&pool, &format!("SELECT 'secret'::{underscore_scalar_type} AS hidden")).await?;
+            let vector_named_enum =
+                execute_query(&pool, &format!("SELECT 'label'::{vector_named_enum_type} AS label")).await?;
+            let client = checkout_postgres_client(&pool, None, Duration::from_secs(5)).await?;
+
+            let mut query_export_rows = Vec::new();
+            stream_select_query_inner(&client, &select_sql, None, &mut |item| {
+                if let PostgresQueryStreamItem::Row(row) = item {
+                    query_export_rows.push(row);
+                }
+                Ok(())
+            })
+            .await?;
+
+            let cancelled = AtomicBool::new(false);
+            let mut table_export_rows = Vec::new();
+            stream_query_rows_on_client(&client, &select_sql, None, &cancelled, &mut |row| {
+                table_export_rows.push(row.to_vec());
+                Ok(())
+            })
+            .await?;
+            drop(client);
+
+            Ok::<_, String>((query, underscore_scalar, vector_named_enum, query_export_rows, table_export_rows))
+        }
+        .await;
+
+        let cleanup = execute_query(&pool, &format!("DROP SCHEMA {schema_ident} CASCADE")).await;
+        cleanup.expect("drop schema");
+        let (query, underscore_scalar, vector_named_enum, query_export_rows, table_export_rows) =
+            exercise.expect("exercise custom array fallbacks");
+        let expected = vec![
+            serde_json::Value::String(r#"{"(7,alpha)"}"#.to_string()),
+            serde_json::Value::String("{ready}".to_string()),
+            serde_json::Value::String("{7}".to_string()),
+        ];
+
+        assert_eq!(query.rows, vec![expected.clone()]);
+        assert_eq!(underscore_scalar.rows, vec![vec![serde_json::Value::String("secret".to_string())]]);
+        assert_eq!(vector_named_enum.rows, vec![vec![serde_json::Value::String("label".to_string())]]);
+        assert_eq!(query_export_rows, vec![expected.clone()]);
+        assert_eq!(table_export_rows, vec![expected]);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_TEST_POSTGRES_URL pointing at a writable PostgreSQL 18 database"]
     async fn postgres_custom_type_fallback_refreshes_stale_cached_metadata() {
         let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("DBX_TEST_POSTGRES_URL");
         let pool_a = connect(&url, Duration::from_secs(5)).await.expect("connect postgres pool A");
@@ -3949,20 +4085,30 @@ mod tests {
                  FROM generate_series(1, 2) AS series(i)"
             );
             let limited = execute_select_query(&client, &custom_sql, Instant::now(), 1).await;
+            let cancelled = AtomicBool::new(false);
+            let mut exported_rows = Vec::new();
+            let exported = stream_query_rows_on_client(&client, &custom_sql, Some(1), &cancelled, &mut |row| {
+                exported_rows.push(row.to_vec());
+                Ok(())
+            })
+            .await;
             let recovery = execute_select_query(&client, "SELECT 1::int4 AS value", Instant::now(), 1).await;
             drop(client);
-            Ok::<_, String>((limited, recovery))
+            Ok::<_, String>((limited, exported, exported_rows, recovery))
         }
         .await;
 
         let cleanup = execute_query(&pool, &format!("DROP SCHEMA {schema_ident} CASCADE")).await;
         cleanup.expect("drop schema");
-        let (limited, recovery) = exercise.expect("set up late row error query");
+        let (limited, exported, exported_rows, recovery) = exercise.expect("set up late row error query");
         let limited = limited.expect("query should stop before late row error");
+        let exported = exported.expect("streamed export should stop before late row error");
         let recovery = recovery.expect("connection should remain reusable");
         assert_eq!(limited.column_types, vec!["payload"]);
         assert_eq!(limited.rows, vec![vec![serde_json::Value::String("(1)".to_string())]]);
         assert!(limited.truncated);
+        assert_eq!(exported, 1);
+        assert_eq!(exported_rows, vec![vec![serde_json::Value::String("(1)".to_string())]]);
         assert_eq!(recovery.column_types, vec!["int4"]);
         assert_eq!(recovery.rows[0][0], serde_json::Value::Number(1.into()));
     }
