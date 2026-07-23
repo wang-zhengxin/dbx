@@ -3711,6 +3711,9 @@ mod tests {
         let types = vec!["payload_type".to_string()];
         assert!(matching_pg_text_column_types(&columns, Some(types)).is_empty());
         assert!(matching_pg_text_column_types(&columns, None).is_empty());
+    }
+
+    #[test]
     fn database_list_does_not_collect_storage_usage() {
         assert!(list_databases_sql().contains("pg_database"));
         assert!(!list_databases_sql().contains("pg_database_size"));
