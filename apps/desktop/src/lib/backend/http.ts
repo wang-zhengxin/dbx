@@ -3,6 +3,7 @@ import type {
   ConnectionTestResult,
   DatabaseConnectionInfo,
   DatabaseInfo,
+  DatabaseStorageInfo,
   SchemaInfo,
   LinkedServerInfo,
   CatalogInfo,
@@ -74,6 +75,7 @@ import type {
   KvPutOptions,
   KvPutResponse,
   KvDeleteResponse,
+  DocumentQueryResult,
   MongoDocumentResult,
   MongoCollectionStatsResult,
   MongoGridFsBucketInfo,
@@ -148,6 +150,7 @@ import type {
   NacosConfigRollbackRequest,
   NacosConfigUpsert,
   NacosConnectionInfo,
+  NacosRNacosConsoleCaptcha,
   NacosInstanceInfo,
   NacosInstanceQuery,
   NacosInstanceUpdate,
@@ -570,6 +573,10 @@ export async function listDatabases(connectionId: string): Promise<DatabaseInfo[
   return get(`/api/schema/databases?${qs({ connection_id: connectionId })}`);
 }
 
+export async function listDatabaseStorage(connectionId: string, databases: string[]): Promise<DatabaseStorageInfo[]> {
+  return post("/api/schema/database-storage", { connection_id: connectionId, databases });
+}
+
 export async function listDorisCatalogs(connectionId: string): Promise<CatalogInfo[]> {
   return get(`/api/schema/doris/catalogs?${qs({ connection_id: connectionId })}`);
 }
@@ -650,8 +657,8 @@ export async function completionAssistantSearch(request: CompletionAssistantRequ
   return post("/api/schema/completion-assistant", request);
 }
 
-export async function getObjectSource(connectionId: string, database: string, schema: string, name: string, objectType: ObjectSourceKind, signature?: string): Promise<ObjectSource> {
-  return get(`/api/schema/object-source?${qs({ connection_id: connectionId, database, schema, table: name, object_type: objectType, signature })}`);
+export async function getObjectSource(connectionId: string, database: string, schema: string, name: string, objectType: ObjectSourceKind, signature?: string, relationName?: string): Promise<ObjectSource> {
+  return get(`/api/schema/object-source?${qs({ connection_id: connectionId, database, schema, table: name, object_type: objectType, signature, relation_name: relationName })}`);
 }
 
 export async function getColumns(connectionId: string, database: string, schema: string, table: string, catalog?: string, clientSessionId?: string): Promise<ColumnInfo[]> {
@@ -715,7 +722,7 @@ export async function listOwners(connectionId: string, database: string, schema:
   return get(`/api/schema/owners?${qs({ connection_id: connectionId, database, schema })}`);
 }
 
-export async function listExtensions(connectionId: string, database: string, schema: string): Promise<ExtensionInfo[]> {
+export async function listExtensions(connectionId: string, database: string, schema?: string): Promise<ExtensionInfo[]> {
   return get(`/api/schema/extensions?${qs({ connection_id: connectionId, database, schema })}`);
 }
 
@@ -1197,6 +1204,19 @@ export async function saveMcpGlobalPolicy(policy: Omit<McpGlobalPolicy, "configu
   if (!res.ok) throw new Error(await res.text());
 }
 
+export async function loadMaxAgentTurns(): Promise<number> {
+  return get("/api/app-settings/max-agent-turns");
+}
+
+export async function saveMaxAgentTurns(maxAgentTurns: number): Promise<void> {
+  const res = await fetch(apiUrl("/api/app-settings/max-agent-turns"), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ maxAgentTurns }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+}
+
 export interface OpenTabsStatePayload {
   tabs: unknown[];
   activeTabId: string | null;
@@ -1569,10 +1589,15 @@ export async function previewTableImportFile(fileOrPath: string | File | TableIm
     if (!options.sourceRef) {
       throw new Error("previewTableImportFile in web mode requires a File object for new uploads");
     }
-    const res = await fetch(apiUrl("/api/import/preview"), {
+    const res = await fetch(apiUrl("/api/import/preview-source"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ request: { ...options, filePath: fileOrPath } }),
+      body: JSON.stringify({
+        sourceRef: options.sourceRef,
+        sourceFormat: options.sourceFormat,
+        parseOptions: options.parseOptions,
+        previewLimit: options.previewLimit,
+      }),
     });
     if (!res.ok) throw new Error(await res.text());
     return res.json();
@@ -1608,6 +1633,7 @@ export async function importTableFile(request: TableImportRequest, onProgress: (
           importId: progress.importId,
           rowsImported: progress.rowsImported,
           totalRows: progress.totalRows,
+          elapsedMs: progress.elapsedMs,
         };
         es.close();
         resolve(summary);
@@ -1625,6 +1651,11 @@ export async function importTableFile(request: TableImportRequest, onProgress: (
 
 export async function cancelTableImport(importId: string): Promise<boolean> {
   return post("/api/import/cancel", { importId });
+}
+
+export async function releaseTableImportSource(sourceRef: string): Promise<boolean> {
+  const result = await post<{ released: boolean }>("/api/import/source/release", { sourceRef });
+  return result.released;
 }
 
 // ---------------------------------------------------------------------------
@@ -2071,6 +2102,14 @@ export async function nacosRollbackConfig(connectionId: string, req: NacosConfig
   return post("/api/nacos/configs/history/rollback", { connectionId, req });
 }
 
+export async function nacosGetRNacosConsoleCaptcha(connectionId: string): Promise<NacosRNacosConsoleCaptcha> {
+  return post("/api/nacos/rnacos-console/captcha", { connectionId });
+}
+
+export async function nacosLoginRNacosConsole(connectionId: string, captcha?: string): Promise<void> {
+  return post("/api/nacos/rnacos-console/login", { connectionId, captcha });
+}
+
 export async function nacosListServices(connectionId: string, query: NacosServiceQuery): Promise<NacosServiceList> {
   return post("/api/nacos/services/list", { connectionId, query });
 }
@@ -2149,8 +2188,12 @@ export async function mongoFindOne(connectionId: string, database: string, colle
   return post("/api/mongo/find-one", { connectionId, database, collection, filter, projection, options, executionId });
 }
 
-export async function documentFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, executionId?: string): Promise<MongoDocumentResult> {
+export async function documentFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, executionId?: string): Promise<DocumentQueryResult> {
   return post("/api/document-store/find-documents", { connectionId, database, collection, skip, limit, filter, projection, sort, executionId });
+}
+
+export async function elasticsearchCountDocuments(connectionId: string, index: string, filter?: string, executionId?: string): Promise<number> {
+  return post("/api/document-store/elasticsearch-count-documents", { connectionId, index, filter, executionId });
 }
 
 export async function mongoCountDocuments(connectionId: string, database: string, collection: string, filter?: string, mode?: "accurate" | "legacy", executionId?: string): Promise<number> {

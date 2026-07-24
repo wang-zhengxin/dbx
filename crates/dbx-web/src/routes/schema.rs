@@ -20,9 +20,16 @@ pub struct SchemaQuery {
     pub offset: Option<usize>,
     pub object_type: Option<dbx_core::db::ObjectSourceKind>,
     pub signature: Option<String>,
+    pub relation_name: Option<String>,
     pub object_types: Option<String>,
     pub apply_visible_filter: Option<bool>,
     pub client_session_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct DatabaseStorageRequest {
+    pub connection_id: String,
+    pub databases: Vec<String>,
 }
 
 pub async fn list_databases(
@@ -31,6 +38,16 @@ pub async fn list_databases(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let result = dbx_core::schema::list_databases_core(&state.app, &q.connection_id).await.map_err(AppError::from)?;
     Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
+}
+
+pub async fn list_database_storage(
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<DatabaseStorageRequest>,
+) -> Result<Json<Vec<dbx_core::db::DatabaseStorageInfo>>, AppError> {
+    let result = dbx_core::schema::list_database_storage_core(&state.app, &request.connection_id, &request.databases)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(result))
 }
 
 /// Resolve a non-internal catalog for dispatch to the Doris multi-catalog path.
@@ -286,6 +303,7 @@ pub async fn get_object_source(
         name,
         object_type,
         q.signature.as_deref(),
+        q.relation_name.as_deref(),
     )
     .await
     .map_err(AppError::from)?;
@@ -471,8 +489,7 @@ pub async fn list_extensions(
     Query(q): Query<SchemaQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let database = q.database.as_deref().unwrap_or("");
-    let schema = q.schema.as_deref().unwrap_or("");
-    let result = dbx_core::schema::list_extensions_core(&state.app, &q.connection_id, database, schema)
+    let result = dbx_core::schema::list_extensions_core(&state.app, &q.connection_id, database, q.schema.as_deref())
         .await
         .map_err(AppError::from)?;
     Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))

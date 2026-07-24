@@ -44,6 +44,7 @@ import { resolveDefaultDatabase } from "@/lib/database/defaultDatabase";
 import { findTreeNodeById, resolveNewQueryTarget, resolveNewQueryInitialSql } from "@/lib/sql/newQueryContext";
 import { sqlObjectNavigationSourceKind, sqlObjectNavigationTableType, type SqlObjectNavigationTarget } from "@/lib/sql/sqlNavigation";
 import { buildExecutableObjectSourceStatements, executeObjectSourceSave } from "@/lib/table/objectSourceEditor";
+import { schemaAfterConnectionSwitch } from "@/lib/schema/connectionSchemaInitialization";
 import { resolveExecutableSql, resolveExecutableSqlWithBackend, type SqlExecutionSnapshot } from "@/lib/sql/sqlExecutionTarget";
 import { uuid } from "@/lib/common/utils";
 import { isMacOS, isWindows } from "@/lib/backend/platform";
@@ -85,7 +86,7 @@ import { countAvailableAgentDriverUpdates, type AgentDriverUpdateBadgeState } fr
 import type { DriverStoreFocus } from "@/lib/connection/agentDriverInstallHint";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
 import { apiUrl, webPath } from "@/lib/common/webPath";
-import { APP_FONT_SANS_CSS_VAR, DEFAULT_UI_FONT_FAMILY } from "@/lib/app/appFonts";
+import { APP_FONT_SANS_CSS_VAR, DATA_GRID_FONT_FAMILY_CSS_VAR, DEFAULT_DATA_GRID_FONT_FAMILY, DEFAULT_UI_FONT_FAMILY } from "@/lib/app/appFonts";
 import { rankSavedSqlHistory } from "@/lib/savedSql/savedSqlHistory";
 import { countActiveUpdateBlockingTasks } from "@/lib/app/appUpdateTaskGuard";
 import { initSavedSqlEditorPositions } from "@/lib/app/savedSqlEditorPosition";
@@ -204,6 +205,7 @@ const contentAreaRef = ref<InstanceType<typeof ContentArea> | null>(null);
 const selectedSql = ref("");
 const cursorPos = ref(0);
 const formatSqlRequest = ref<{ id: number; tabId: string } | null>(null);
+const compressSqlRequest = ref<{ id: number; tabId: string } | null>(null);
 const activeOutputView = ref<"result" | "summary" | "explain" | "chart">("result");
 const newQueryContextSource = ref<"tab" | "sidebar">("tab");
 const queryEditorDdlTarget = ref<{ connectionId: string; database: string; catalog?: string; schema?: string; tableName: string; objectType?: ObjectSourceKind } | null>(null);
@@ -502,6 +504,11 @@ function applyUiFontFamily(fontFamily: string) {
   document.body.style.fontFamily = `var(${APP_FONT_SANS_CSS_VAR}, ${DEFAULT_UI_FONT_FAMILY})`;
 }
 
+function applyDataGridFontFamily(fontFamily: string) {
+  if (typeof document === "undefined") return;
+  document.documentElement.style.setProperty(DATA_GRID_FONT_FAMILY_CSS_VAR, fontFamily || DEFAULT_DATA_GRID_FONT_FAMILY);
+}
+
 const appUiFontFamilyStyle = computed<Record<string, string>>(() => {
   const fontFamily = settingsStore.editorSettings.uiFontFamily || DEFAULT_UI_FONT_FAMILY;
   return {
@@ -559,6 +566,14 @@ watch(
   () => settingsStore.editorSettings.uiFontFamily,
   (fontFamily) => {
     applyUiFontFamily(fontFamily);
+  },
+  { immediate: true },
+);
+
+watch(
+  () => settingsStore.editorSettings.tableFontFamily,
+  (fontFamily) => {
+    applyDataGridFontFamily(fontFamily);
   },
   { immediate: true },
 );
@@ -664,6 +679,15 @@ function formatActiveSql() {
   if (!tab || tab.mode !== "query" || !tab.sql.trim()) return;
   formatSqlRequest.value = {
     id: (formatSqlRequest.value?.id ?? 0) + 1,
+    tabId: tab.id,
+  };
+}
+
+function compressActiveSql() {
+  const tab = activeTab.value;
+  if (!tab || tab.mode !== "query" || !tab.sql.trim()) return;
+  compressSqlRequest.value = {
+    id: (compressSqlRequest.value?.id ?? 0) + 1,
     tabId: tab.id,
   };
 }
@@ -1459,7 +1483,19 @@ async function changeActiveConnection(connectionId: string) {
   try {
     await connectionStore.ensureConnected(connectionId);
     const options = await getDatabaseOptions(connectionId);
-    queryStore.updateDatabase(tab.id, resolveDefaultDatabase(connection, options));
+    const database = resolveDefaultDatabase(connection, options);
+    queryStore.updateDatabase(tab.id, database);
+    if (connection.db_type === "oracle") {
+      try {
+        // Oracle returns the session's current schema first; preserve that order before toolbar sorting.
+        const schema = schemaAfterConnectionSwitch(connection.db_type, await api.listSchemas(connectionId, database));
+        if (schema && activeTab.value?.id === tab.id && activeTab.value.connectionId === connectionId) {
+          queryStore.updateSchema(tab.id, schema);
+        }
+      } catch {
+        // Schema metadata failure must not turn a successful connection switch into a connection error.
+      }
+    }
   } catch (e: any) {
     toast(
       t("connection.connectFailed", {
@@ -1598,7 +1634,30 @@ async function handleQuickOpenSelect(item: any) {
   const connectionStore = useConnectionStore();
   const queryStore = useQueryStore();
 
-  // For all types, set the active connection
+  // Handle SQL file types first — they don't require a database connection
+  if (item.type === "sql_file" && item.filePath) {
+    try {
+      const content = await api.readExternalSqlFile(item.filePath);
+      const connectionId = connectionStore.activeConnectionId || connectionStore.connections[0]?.id || "";
+      const connection = connectionId ? connectionStore.getConfig(connectionId) : undefined;
+      const database = connection ? resolveDefaultDatabase(connection, []) : "";
+      queryStore.openExternalSqlFile(connectionId, database, item.filePath, content);
+    } catch (e: any) {
+      toast(e?.message || String(e), 5000);
+    }
+    return;
+  }
+
+  if (item.type === "sql_library_file" && item.sqlFileId) {
+    const file = await savedSqlStore.ensureFileContent(item.sqlFileId);
+    if (!file) return;
+    queryStore.openSavedSql(file);
+    connectionStore.activeConnectionId = file.connectionId;
+    void savedSqlStore.recordFileUsage(file.id);
+    return;
+  }
+
+  // For all other types, set the active connection
   connectionStore.activeConnectionId = item.connectionId;
 
   // Ensure connection is connected
@@ -2177,6 +2236,7 @@ onUnmounted(() => {
                   @cancel="cancelActiveExecution()"
                   @explain="tryExplain()"
                   @format-sql="formatActiveSql"
+                  @compress-sql="compressActiveSql"
                   @toggle-sql-keyword-case="toggleSqlKeywordCase"
                   @save-sql="void openSaveSqlDialog()"
                   @open-sql="openSqlFile"
@@ -2197,6 +2257,7 @@ onUnmounted(() => {
                     :executable-sql="executableSql"
                     :active-output-view="activeOutputView"
                     :format-sql-request="formatSqlRequest"
+                    :compress-sql-request="compressSqlRequest"
                     :selected-sql="selectedSql"
                     :cursor-pos="cursorPos"
                     :block-dangerous-redis-commands="blockDangerousRedisCommands"

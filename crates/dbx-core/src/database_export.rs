@@ -1300,8 +1300,13 @@ pub async fn export_database_sql_core(
             PostgresExtensionMembers::default()
         };
     let postgres_extensions = if request.include_structure && matches!(db_type, DatabaseType::Postgres) {
-        match crate::schema::list_extensions_core(state, &request.connection_id, &request.database, &request.schema)
-            .await
+        match crate::schema::list_extensions_core(
+            state,
+            &request.connection_id,
+            &request.database,
+            Some(&request.schema),
+        )
+        .await
         {
             Ok(extensions) => extensions
                 .into_iter()
@@ -1846,6 +1851,7 @@ pub async fn export_database_sql_core(
                 view_name,
                 crate::db::ObjectSourceKind::View,
                 None,
+                None,
             )
             .await
             {
@@ -1896,6 +1902,7 @@ pub async fn export_database_sql_core(
                 proc_name,
                 crate::db::ObjectSourceKind::Procedure,
                 procedure.signature.as_deref(),
+                None,
             )
             .await
             {
@@ -1950,6 +1957,7 @@ pub async fn export_database_sql_core(
                 func_name,
                 crate::db::ObjectSourceKind::Function,
                 function.signature.as_deref(),
+                None,
             )
             .await
             {
